@@ -12,6 +12,7 @@ files_to_zip=(
     infer_class.py
     main.py
     model.py
+    info_only.py
     model_rqvae.py
 )
 

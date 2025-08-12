@@ -9,6 +9,67 @@ from dataset import save_emb
 import torch
 import torch.nn.functional as F
 
+def info_nce_loss(anchor, positive, negatives=None, temperature=0.1, use_inbatch_negatives=True):
+    """
+    InfoNCE Loss 支持：
+    - 显式负样本 (negatives)
+    - batch 内负样本 (可选)
+    
+    Args:
+        anchor: (N, D)
+        positive: (N, D)
+        negatives: (N, K, D) 或 None
+        temperature: float
+        use_inbatch_negatives: bool, 是否使用 batch 内其他样本作为负样本
+    
+    Returns:
+        loss: scalar
+    """
+    device = anchor.device
+    batch_size = anchor.size(0)
+
+    # L2 归一化
+    # anchor = F.normalize(anchor, dim=1)      # (N, D)
+    # positive = F.normalize(positive, dim=1)  # (N, D)
+
+    # ========== 构建 logits ==========
+    # 正样本相似度: (N, 1)
+    pos_sim = torch.sum(anchor * positive, dim=1, keepdim=True)  # (N, 1)
+
+    # 显式负样本相似度: (N, K)
+    neg_sim_list = []
+
+    if negatives is not None:
+        K = negatives.size(1)
+        # negatives = F.normalize(negatives, dim=2)  # (N, K, D)
+        explicit_neg_sim = torch.bmm(anchor.unsqueeze(1), negatives.transpose(1, 2))  # (N, 1, K)
+        explicit_neg_sim = explicit_neg_sim.squeeze(1)  # (N, K)
+        neg_sim_list.append(explicit_neg_sim)
+
+    # batch 内负样本: anchor 与所有 positive 的相似度，去掉对角线（自己）
+    if use_inbatch_negatives:
+        # 计算 anchor 与所有 positive 的相似度（包括自己）
+        inbatch_sim = torch.matmul(anchor, positive.T)  # (N, N)
+        # 创建 mask，去掉对角线（正样本）
+        mask = torch.eye(batch_size, dtype=torch.bool, device=device)
+        inbatch_neg_sim = inbatch_sim.masked_select(~mask).view(batch_size, -1)  # (N, N-1)
+        neg_sim_list.append(inbatch_neg_sim)
+
+    # 拼接所有负样本相似度
+    if neg_sim_list:
+        neg_sim = torch.cat(neg_sim_list, dim=1)  # (N, K + N - 1)
+    else:
+        raise ValueError("At least one type of negative samples must be provided.")
+
+    # 拼接正 + 负
+    logits = torch.cat([pos_sim, neg_sim], dim=1) / temperature  # (N, 1 + K + N - 1)
+
+    # 标签：正样本在第 0 位
+    labels = torch.zeros(batch_size, dtype=torch.long).to(device)
+
+    loss = F.cross_entropy(logits, labels)
+    return loss
+
 def cosine_similarity_loss(a, b):
     """
     计算两个张量 a 和 b 在 hidden 维度上的余弦相似度损失
@@ -331,13 +392,14 @@ class BaselineModel(torch.nn.Module):
 
         # merge features
         all_item_emb = torch.cat(item_feat_list, dim=2)
-        all_item_emb = torch.tanh(self.itemdnn(all_item_emb))
+        all_item_emb = torch.relu(self.itemdnn(all_item_emb))
         if include_user:
             all_user_emb = torch.cat(user_feat_list, dim=2)
-            all_user_emb = torch.tanh(self.userdnn(all_user_emb))
+            all_user_emb = torch.relu(self.userdnn(all_user_emb))
             seqs_emb = all_item_emb + all_user_emb
         else:
             seqs_emb = all_item_emb
+            
         return seqs_emb
 
     def log2feats(self, log_seqs, mask, seq_feature):

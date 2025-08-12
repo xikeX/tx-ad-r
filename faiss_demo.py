@@ -1,4 +1,4 @@
-# faiss_demo_function.py
+# faiss_demo.py
 
 import os
 from pathlib import Path
@@ -77,7 +77,7 @@ def run_faiss_ann_search(
     faiss_M: int = 64,
     faiss_ef_construction: int = 1280,
     query_ef_search: int = 640,
-    faiss_metric_type: int = 0,  # 0: L2, 1: Inner Product
+    faiss_metric_type: int = 1,  # 0: L2, 1: Inner Product
 ) -> None:
     """
     使用 Faiss 构建 HNSW 索引并执行近似最近邻搜索，保存 Top-K 结果 ID。
@@ -125,4 +125,6 @@ def run_faiss_ann_search(
     print(f"Writing Top-{query_ann_top_k} results to {result_id_file_path}")
     save_emb(indices.astype(np.uint64),result_id_file_path)
 
+    # 输出平均距离
+    print(f"Average distance: {np.mean(distances)}")
     print("ANN search completed.")

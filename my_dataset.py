@@ -1,3 +1,4 @@
+#my_dataset.py
 from io import BufferedReader
 import json
 import os
@@ -505,8 +506,6 @@ class EmbeddingDataset(torch.utils.data.IterableDataset):
         user_sequence = self.base_dataset._load_user_data(uid)
         
         self.build_example_cache(user_sequence)
-    def __len__(self):
-        return len(self.sample_index)
     
     def build_example_cache(self):
         self.cache = []

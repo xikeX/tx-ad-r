@@ -1,7 +1,4 @@
 #!/bin/bash
-
-export DEBUG_MODE="True"
-
 # show ${RUNTIME_SCRIPT_DIR}
 echo ${RUNTIME_SCRIPT_DIR}
 # enter train workspace
@@ -15,4 +12,4 @@ zip_file="myarchive.zip"
 unzip -o "$zip_file"
 
 # write your code below
-python -u main.py
+python -u main.py --use_lr_scheduler_in_downstream

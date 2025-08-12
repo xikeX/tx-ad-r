@@ -1,3 +1,4 @@
+# infer_class.py
 import argparse
 import os
 # os.environ['TRAIN_LOG_PATH'] = './log'
@@ -111,9 +112,7 @@ class Infer:
         top10s = [top10s_untrimmed[i : i + 10] for i in range(0, len(top10s_untrimmed), 10)]
         # 根据labels和ids计算hit_rate和ndcg
         hit_rate = sum([labels[i] in top10s[i] for i in range(len(top10s))])/len(top10s)
-
-        print(f"hit_rate: {hit_rate}")
-    
+        return hit_rate
     def get_candidate_emb(self):
         """
         生产候选库item的id和embedding

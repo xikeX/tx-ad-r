@@ -4,3 +4,9 @@ TencentGR_1k/creative_emb/emb_84_4096/
 TencentGR_1k/creative_emb/emb_85_4096/
 TencentGR_1k/creative_emb/emb_86_3584/
 eval_result/
+*.pyc
+user_cache_file/
+result_save/
+log_path/
+checkpoint/
+__pycache__/*
