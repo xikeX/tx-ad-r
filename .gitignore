@@ -10,3 +10,4 @@ result_save/
 log_path/
 checkpoint/
 __pycache__/*
+temp/

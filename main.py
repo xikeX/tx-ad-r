@@ -11,9 +11,15 @@ if os.environ.get("DEBUG_MODE","") == 'True':
     os.environ['USER_CACHE_PATH']='./user_cache_file'
     os.environ['DEBUG_MODE'] = 'True'
     # 设置单GPU
-os.environ['TEMP_PATH'] = './temp'
+import os
+from transformers import get_cosine_schedule_with_warmup
+# 获取当前目录（'.'）的绝对路径
+current_abs_path = os.path.abspath('./temp')
+os.environ['TEMP_PATH'] = current_abs_path
 os.makedirs(os.environ['TEMP_PATH'], exist_ok = True)
-os.environ['EVAL_RESULT_PATH'] = './eval_result'
+current_abs_path = os.path.abspath('./eval_result')
+os.environ['EVAL_RESULT_PATH'] = current_abs_path
+os.makedirs(os.environ['EVAL_RESULT_PATH'], exist_ok = True)
 
 """
 训练主脚本：用于训练嵌入模型（Embedding Model），并加载到下游模型中进行后续任务。
@@ -33,10 +39,13 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from torch.nn.utils import clip_grad_norm_
 
+torch.backends.cuda.matmul.allow_tf32 = True
+# The flag below controls whether to allow TF32 on cuDNN. This flag defaults to True.
+torch.backends.cudnn.allow_tf32 = True
 # 自定义模块
 from my_dataset import BaseDataset, TrainDataset, EmbeddingDataset, ValidDataset
-from embedding_model import BaselineModel as EmbeddingModel
-from model import BaselineModel as DownstreamModel
+from split_embedding_model import ADEmbeddingLayer as EmbeddingModel
+from split_embedding_model import BaselineModel as DownstreamModel
 from transformers import get_cosine_schedule_with_warmup
 import torch
 import torch.nn as nn
@@ -65,31 +74,39 @@ def get_args():
     # 训练参数
     parser.add_argument('--batch_size', type=int, default=32, help='训练/验证批大小')
     # 训练emmbedding的batch_size
-    parser.add_argument('--embedding_batch_size', type=int, default=5, help='训练embedding的批大小')
-    parser.add_argument('--lr', type=float, default=1e-2, help='学习率')
+    parser.add_argument('--embedding_batch_size', type=int, default=64, help='训练embedding的批大小')
+    parser.add_argument('--train_data_size', type=int, default=-1, help='训练数据大小')
+    parser.add_argument('--embedding_task_lr', type=float, default=1e-3, help='学习率')
+    parser.add_argument('--downstream_task_lr', type=float, default=1e-3, help='学习率')
     parser.add_argument('--maxlen', type=int, default=101, help='序列最大长度')
 
     # 模型结构参数
     parser.add_argument('--hidden_units', type=int, default=64, help='隐藏层维度')
-    parser.add_argument('--num_blocks', type=int, default=1, help='Transformer 块数')
+    parser.add_argument('--num_blocks', type=int, default=4, help='Transformer 块数')
     parser.add_argument('--num_epochs', type=int, default=25, help='训练总轮数')
     parser.add_argument('--num_heads', type=int, default=4, help='多头注意力头数')
     parser.add_argument('--dropout_rate', type=float, default=0.1, help='Dropout 比例')
     parser.add_argument('--l2_emb', type=float, default=0.0, help='嵌入层L2正则强度')
-    parser.add_argument('--device', type=str, default='cpu', help='运行设备: cpu 或 cuda')
+    parser.add_argument('--device', type=str, default='', help='运行设备: cpu 或 cuda')
     parser.add_argument('--inference_only', action='store_true', help='仅推理模式')
     parser.add_argument('--state_dict_path', type=str, default=None, help='预训练权重路径')
     parser.add_argument('--norm_first', action='store_true', help='是否在Transformer中先归一化')
+    parser.add_argument('--weight_decay', type=float, default=0.0)
     parser.add_argument('--mm_emb_id', nargs='+', type=str, default=['81'],
                         choices=[str(s) for s in range(81, 87)],
                         help='多模态嵌入特征ID列表')
-    parser.add_argument("--warm_up_rate", default=0.1, type=float, help="warm up 的比例")
+    parser.add_argument("--warm_up_rate", default=0.05, type=float, help="warm up 的比例")
     
     # 模型模块/训练模块参数
     parser.add_argument("--use_embedding_model", action="store_true", help="是否使用预训练的模型权重")
     # 使用在下游任务中使用学习率策略
     parser.add_argument("--use_lr_scheduler_in_downstream", action="store_true", help="是否使用在下游任务中使用学习率策略")
-    return parser.parse_args()
+
+    parser.add_argument("--use_lr_scheduler_in_embedding_task", action="store_true", help="是否使用在嵌入任务中使用学习率策略")
+    args = parser.parse_args()
+    if args.device =='':
+        args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    return args
 
 
 def initialize_model_weights(model: nn.Module):
@@ -124,13 +141,16 @@ def initialize_model_weights(model: nn.Module):
             emb_layer.weight.data[0, :] = 0
 
 
-def train_embedding_model(embedding_model, train_loader, valid_loader, optimizer, scheduler, args, writer, log_file, global_step):
+def train_embedding_model(embedding_model:EmbeddingModel, train_loader, valid_loader, optimizer, args, writer, log_file, global_step,verbose = False):
     """训练嵌入模型主循环"""
     print("开始训练嵌入模型...")
     bce_criterion = nn.BCEWithLogitsLoss(reduction='mean')
     best_val_loss = float('inf')
     # 设置策略warmup 和 cosine decay策略
-
+    scheduler=None
+    if args.use_lr_scheduler_in_embedding_task:
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(args.warm_up_rate * len(train_loader)),
+                                                num_training_steps=args.num_epochs * len(train_loader))
     for epoch in range(1, args.num_epochs + 1):
         embedding_model.train()
         if args.inference_only:
@@ -153,17 +173,25 @@ def train_embedding_model(embedding_model, train_loader, valid_loader, optimizer
                     # ======== 前向传播（使用自动混合精度可选）========
                     if scaler:
                         with torch.cuda.amp.autocast():
-                            info_nce_loss = embedding_model(
-                                user, input_item, pos_item, neg_item,
-                                user_feat, input_item_feat, pos_item_feat, neg_item_feat
-                            )
-                            loss = info_nce_loss
+                            user_embedding = embedding_model(user,user_feat).squeeze(0)
+                            item_1_embedding = embedding_model(input_item,input_item_feat).squeeze(0)
+                            pos_item_embedding = embedding_model(pos_item,pos_item_feat).squeeze(0)
+                            neg_item_1_embedding = embedding_model(neg_item,neg_item_feat).squeeze(0)
+                            neg_item_2_embedding = embedding_model(neg_item,neg_item_feat).squeeze(0)
+                            u2i_loss,u2i_pos_sim,u2i_neg_sim = embedding_model.embedding_loss(user_embedding,item_1_embedding,neg_item_1_embedding)
+                            i2i_loss,i2i_pos_sim,i2i_neg_sim = embedding_model.embedding_loss(item_1_embedding,pos_item_embedding,neg_item_2_embedding)
+                            self_i2i_loss,i2i_pos_sim,i2i_neg_sim = embedding_model.embedding_loss(neg_item_1_embedding.reshape(-1,neg_item_1_embedding.shape[-1]),neg_item_1_embedding.reshape(-1,neg_item_1_embedding.shape[-1]))
+                            loss = u2i_loss + i2i_loss 
                     else:
-                        info_nce_loss = embedding_model(
-                                user, input_item, pos_item, neg_item,
-                                user_feat, input_item_feat, pos_item_feat, neg_item_feat
-                            )
-                        loss = info_nce_loss
+                        user_embedding = embedding_model(user,user_feat).squeeze(0)
+                        item_1_embedding = embedding_model(input_item,input_item_feat).squeeze(0)
+                        pos_item_embedding = embedding_model(pos_item,pos_item_feat).squeeze(0)
+                        neg_item_1_embedding = embedding_model(neg_item,neg_item_feat).squeeze(0)
+                        # neg_item_2_embedding = embedding_model(neg_item,neg_item_feat).squeeze(0)
+                        u2i_loss,u2i_pos_sim,u2i_neg_sim = embedding_model.embedding_loss(user_embedding,item_1_embedding,neg_item_1_embedding)
+                        i2i_loss,i2i_pos_sim,i2i_neg_sim = embedding_model.embedding_loss(item_1_embedding,pos_item_embedding,neg_item_1_embedding)
+                        self_i2i_loss,i2i_pos_sim,i2i_neg_sim = embedding_model.embedding_loss(neg_item_1_embedding.reshape(-1,neg_item_1_embedding.shape[-1]),neg_item_1_embedding.reshape(-1,neg_item_1_embedding.shape[-1]))
+                        loss = u2i_loss + i2i_loss 
 
                         # L2 正则化：仅作用于 item_emb，避免过强惩罚
                         if args.l2_emb > 0:
@@ -197,34 +225,30 @@ def train_embedding_model(embedding_model, train_loader, valid_loader, optimizer
                     total_loss_epoch += loss.item()
 
                     # 当前学习率
-                    current_lr = scheduler.get_last_lr()[0] if scheduler is not None else args.lr
+                    current_lr = scheduler.get_last_lr()[0] if scheduler is not None else args.embedding_task_lr
 
                     log_json = json.dumps({
                         'global_step': global_step,
                         'total_loss': round(loss.item(), 6),
-                        'info_nce_loss': round(info_nce_loss.item(), 6),
-                        'l2_reg_loss': round((loss - info_nce_loss).item(), 6) if args.l2_emb > 0 else 0.0,
+                        'u2i_loss': round(u2i_loss.item(), 6),
+                        "i2i_loss": round(i2i_loss.item(), 6),
                         'learning_rate': round(current_lr, 8),
                         'epoch': epoch,
                         'time': time.time()
                     })
                     log_file.write(log_json + '\n')
+                    if verbose:
+                        print(log_json)
                     log_file.flush()
 
-                    writer.add_scalar('Loss/Train', loss.item(), global_step)
-                    writer.add_scalar('Loss/InfoNCE', info_nce_loss.item(), global_step)
-                    if args.l2_emb > 0:
-                        writer.add_scalar('Loss/L2_Reg', (loss - info_nce_loss).item(), global_step)
-                    writer.add_scalar('Learning_rate', current_lr, global_step)
+                    writer.add_scalar('Emd_Loss/total_loss', loss.item(), global_step)
+                    writer.add_scalar('Emd_Loss/u2i_loss', u2i_loss.item(), global_step)
+                    writer.add_scalar('Emd_Loss/i2i_loss', i2i_loss.item(), global_step)
+                    writer.add_scalar('Emd_Loss/self_i2i_loss', self_i2i_loss.item(), global_step)
+                    writer.add_scalar('Emd_Loss/Learning_rate', current_lr, global_step)
 
                     global_step += 1
                     pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{current_lr:.2e}'})
-                    if global_step % 200 == 0:
-                        for name, param in embedding_model.named_parameters():
-                            writer.add_histogram(f'params/{name}', param, global_step)
-                            if param.grad is not None:
-                                writer.add_histogram(f'grads/{name}', param.grad, global_step)
-                                print(f"grad/{name} : {param.grad.mean()}")
                 except Exception as e:
                     print(f"\n❌ Error at epoch {epoch}, step {step}: {str(e)}")
                     # 可选：保存当前 batch 数据用于 debug
@@ -238,26 +262,44 @@ def train_embedding_model(embedding_model, train_loader, valid_loader, optimizer
         # 验证阶段
         embedding_model.eval()
         val_loss = 0.0
+        val_ui2_loss = 0.0
+        val_i2i_loss = 0.0
+        val_self_i2i_loss = 0.0
         vel_local_step = 0
         with torch.no_grad():
             for batch in tqdm(valid_loader, total=-1, desc="Validation", leave=True):
                 user, input_item, pos_item, neg_item, \
                 user_feat, input_item_feat, pos_item_feat, neg_item_feat = batch
 
-                info_nce_loss = embedding_model(
-                    user, input_item, pos_item, neg_item,
-                    user_feat, input_item_feat, pos_item_feat, neg_item_feat
-                )
-                val_loss += info_nce_loss.item()
+                user_embedding = embedding_model(user,user_feat).squeeze(0)
+                item_1_embedding = embedding_model(input_item,input_item_feat).squeeze(0)
+                pos_item_embedding = embedding_model(pos_item,pos_item_feat).squeeze(0)
+                neg_item_1_embedding = embedding_model(neg_item,neg_item_feat).squeeze(0)
+                neg_item_2_embedding = embedding_model(neg_item,neg_item_feat).squeeze(0)
+                u2i_loss,u2i_pos_sim,u2i_neg_sim = embedding_model.embedding_loss(user_embedding,item_1_embedding,neg_item_1_embedding)
+                i2i_loss,i2i_pos_sim,i2i_neg_sim = embedding_model.embedding_loss(item_1_embedding,pos_item_embedding,neg_item_1_embedding)
+                self_i2i_loss,i2i_pos_sim,i2i_neg_sim = embedding_model.embedding_loss(neg_item_1_embedding.reshape(-1,neg_item_1_embedding.shape[-1]),neg_item_1_embedding.reshape(-1,neg_item_1_embedding.shape[-1]))
+                loss = u2i_loss + i2i_loss 
+
+                val_loss += loss.item()
+                val_ui2_loss += u2i_loss.item()
+                val_i2i_loss += i2i_loss.item()
+                val_self_i2i_loss += self_i2i_loss.item()
                 vel_local_step += 1
 
         val_loss /= vel_local_step
-        writer.add_scalar('Loss/Valid', val_loss, global_step)
-        print(f"Epoch {epoch} | Valid Loss: {val_loss:.4f}")
+        val_ui2_loss /= vel_local_step
+        val_i2i_loss /= vel_local_step
+        val_self_i2i_loss /= vel_local_step
+        writer.add_scalar('Emb_Valid/Loss', val_loss, global_step)
+        writer.add_scalar('Emb_Valid/u2i_loss', val_ui2_loss, global_step)
+        writer.add_scalar('Emb_Valid/i2i_loss', val_i2i_loss, global_step)
+        writer.add_scalar('Emb_Valid/self_i2i_loss', val_self_i2i_loss, global_step)
+        print(f"Epoch {epoch} | Emb_Valid Loss: {val_loss:.4f}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            save_dir = Path(os.environ.get('USER_CACHE_PATH')) / "best_embedding_model"
+            save_dir = Path(os.environ.get('USER_CACHE_PATH')) / "global_best_embedding_model"
             save_dir.mkdir(parents=True, exist_ok=True)
             torch.save(embedding_model.state_dict(), save_dir / "model.pt")
             print(f"✅ 最佳模型已保存至: {save_dir / 'model.pt'}")
@@ -294,7 +336,6 @@ def run_embedding_training(
         embedding_model: 训练完成的模型
         global_step: 总训练步数
     """
-    device = args.device
     print("🚀 开始构建嵌入模型训练流程...")
 
     # ==========================
@@ -303,17 +344,15 @@ def run_embedding_training(
     train_loader = DataLoader(
         train_emb_dataset,
         batch_size=args.embedding_batch_size,
-        num_workers=0,
         collate_fn=train_emb_dataset.collate_fn,
-        shuffle=False  # 确保训练集打乱
+        shuffle=False,  # 确保训练集打乱
     )
 
     valid_loader = DataLoader(
         valid_emb_dataset,
         batch_size=args.batch_size,
-        num_workers=0,
         collate_fn=valid_emb_dataset.collate_fn,
-        shuffle=False
+        shuffle=False,
     )
 
     print(f"📊 训练集 batch 数: {len(train_loader.dataset.sample_index)}, 验证集 batch 数: {len(valid_loader.dataset.sample_index)}")
@@ -327,7 +366,7 @@ def run_embedding_training(
         feat_statistics=train_emb_dataset.base_dataset.feat_statistics,
         feat_types=train_emb_dataset.base_dataset.feature_types,
         args=args
-    ).to(device)
+    ).to(args.device)
 
     # 自定义初始化
     initialize_model_weights(embedding_model)
@@ -338,7 +377,7 @@ def run_embedding_training(
     # ==========================
     if args.state_dict_path:
         try:
-            state_dict = torch.load(args.state_dict_path, map_location=device)
+            state_dict = torch.load(args.state_dict_path, map_location=args.device)
             embedding_model.load_state_dict(state_dict)
             print(f"✅ 成功加载预训练权重: {args.state_dict_path}")
             log_file.write(f"INFO: Loaded pretrained weights from {args.state_dict_path}\n")
@@ -353,34 +392,31 @@ def run_embedding_training(
     # ==========================
     optimizer = torch.optim.Adam(
         embedding_model.parameters(),
-        lr=args.lr,
+        lr=args.embedding_task_lr,
         betas=(0.9, 0.98),
         weight_decay=getattr(args, 'weight_decay', 0.0)  # 可选 weight decay
     )
-    # scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.warm_up_rate * len(train_loader),
-    #                                         num_training_steps=args.num_epochs * len(train_loader))
-    scheduler = None
+
     # ==========================
     # 5. 开始训练
     # ==========================
     global_step = 0
     print("🔥 开始训练...")
-    try:
-        global_step = train_embedding_model(
-            embedding_model=embedding_model,
-            train_loader=train_loader,
-            valid_loader=valid_loader,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            args=args,
-            writer=writer,
-            log_file=log_file,
-            global_step=global_step
-        )
-        print("🎉 训练完成！")
-    except Exception as e:
-        print(f"❌ 训练过程中发生错误: {e}")
-        raise
+    # try:
+    global_step = train_embedding_model(
+        embedding_model=embedding_model,
+        train_loader=train_loader,
+        valid_loader=valid_loader,
+        optimizer=optimizer,
+        args=args,
+        writer=writer,
+        log_file=log_file,
+        global_step=global_step
+    )
+    print("🎉 训练完成！")
+    # except Exception as e:
+    #     print(f"❌ 训练过程中发生错误: {e}")
+    #     raise
 
     # ==========================
     # 6. 保存最终模型
@@ -404,13 +440,16 @@ def train_downstream_model(model, train_loader, valid_loader, optimizer, args, l
     # ✅ 添加：学习率调度器（可选：ReduceLROnPlateau）
     scheduler = None
     if args.use_lr_scheduler_in_downstream:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs * len(train_loader),eta_min=1e-5)
-
+        total_steps = args.num_epochs * len(train_loader)
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=total_steps*0.01,           # 例如：1000 步 warm-up
+            num_training_steps=total_steps   # 总训练步数
+        )
     best_val_loss = float('inf')  # ✅ 记录最佳验证损失
     patience = args.early_stop_patience if hasattr(args, 'early_stop_patience') else 5
     no_improve_count = 0
 
-    bce_criterion = nn.BCEWithLogitsLoss()  # 建议使用 BCEWithLogitsLoss（更稳定）
 
     for epoch in range(1, args.num_epochs + 1):
         model.train()
@@ -419,103 +458,109 @@ def train_downstream_model(model, train_loader, valid_loader, optimizer, args, l
 
         with tqdm(train_loader, desc=f"Epoch {epoch}", leave=False) as pbar:
             for step, batch in enumerate(pbar):
-                try:
-                    # 解包数据
-                    seq, pos, neg, token_type, next_token_type, next_action_type, \
-                    seq_feat, pos_feat, neg_feat = batch
+                # try:
+                # 解包数据
+                seq, pos, neg, token_type, next_token_type, next_action_type, \
+                seq_feat, pos_feat, neg_feat = batch
 
-                    # 移动到设备
-                    seq = seq.to(args.device)
-                    pos = pos.to(args.device)
-                    neg = neg.to(args.device)
-                    token_type = token_type.to(args.device)
-                    next_token_type = next_token_type.to(args.device)
-                    next_action_type = next_action_type.to(args.device)
-                    # seq_feat = seq_feat.to(args.device)
-                    # pos_feat = pos_feat.to(args.device)
-                    # neg_feat = neg_feat.to(args.device)
+                # 移动到设备
+                seq = seq.to(args.device)
+                pos = pos.to(args.device)
+                neg = neg.to(args.device)
+                token_type = token_type.to(args.device)
+                next_token_type = next_token_type.to(args.device)
+                next_action_type = next_action_type.to(args.device)
+                # seq_feat = seq_feat.to(args.device)
+                # pos_feat = pos_feat.to(args.device)
+                # neg_feat = neg_feat.to(args.device)
 
-                    # 前向传播
-                    pos_logits, neg_logits, sim_loss = model(
-                        seq, pos, neg, token_type, next_token_type, next_action_type,
-                        seq_feat, pos_feat, neg_feat
-                    )
+                # 前向传播
+                pos_logits, neg_logits, infoNCE_loss, pos_sim, neg_sim = model(
+                    seq, pos, neg, token_type, next_token_type, next_action_type,
+                    seq_feat, pos_feat, neg_feat
+                )
 
-                    # 只对 next_token_type == 1 的位置计算损失
-                    indices = (next_token_type == 1)  # [B, L]
+                # 只对 next_token_type == 1 的位置计算损失
+                indices = (next_token_type == 1)  # [B, L]
 
-                    # 使用 BCEWithLogitsLoss（自带 sigmoid，数值更稳定）
-                    loss_pos = bce_criterion(pos_logits[indices], torch.ones_like(pos_logits[indices]))
-                    loss_neg = bce_criterion(neg_logits[indices], torch.zeros_like(neg_logits[indices]))
-                    bce_loss = loss_pos + loss_neg
+                # 使用 BCEWithLogitsLoss（自带 sigmoid，数值更稳定）
+                # loss_pos = bce_criterion(pos_logits[indices], torch.ones_like(pos_logits[indices]))
+                # loss_neg = bce_criterion(neg_logits[indices], torch.zeros_like(neg_logits[indices]))
+                # bce_loss = loss_pos + loss_neg
 
-                    # 相似性损失
-                    sim_loss = sim_loss.mean() * getattr(args, 'sim_loss_weight', 10.0)
 
-                    total_loss = bce_loss 
+                total_loss = infoNCE_loss 
 
-                    # L2 正则化（仅 item_emb）
-                    if args.l2_emb > 0:
-                        l2_reg = 0.0
-                        for param in model.item_emb.parameters():
-                            l2_reg += torch.norm(param)
-                        total_loss += args.l2_emb * l2_reg
+                # L2 正则化（仅 item_emb）
+                if args.l2_emb > 0:
+                    l2_reg = 0.0
+                    for param in model.item_emb.parameters():
+                        l2_reg += torch.norm(param)
+                    total_loss += args.l2_emb * l2_reg
 
-                    # ✅ 检查损失是否为 NaN 或 Inf
-                    if torch.isnan(total_loss) or torch.isinf(total_loss):
-                        print(f"❌ 跳过 batch，损失异常（NaN/Inf） at epoch {epoch}, step {step}")
-                        continue
+                # ✅ 检查损失是否为 NaN 或 Inf
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    print(f"❌ 跳过 batch，损失异常（NaN/Inf） at epoch {epoch}, step {step}")
+                    continue
 
-                    # 反向传播
-                    optimizer.zero_grad()
-                    total_loss.backward()
+                # 反向传播
+                optimizer.zero_grad()
+                total_loss.backward()
 
-                    # ✅ 梯度裁剪（防止梯度爆炸）
-                    # if epoch>30:
-                    #     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    
-                    # 输出所有层的梯度到writer
-                    for name, param in model.named_parameters():
-                        if param.requires_grad and param.grad is not None:
-                            writer.add_scalar(name + '_grad', param.grad.norm(), global_step)
-                    optimizer.step()
-                    # scheduler.step()
+                # ✅ 梯度裁剪（防止梯度爆炸）
+                # if epoch>30:
+                #     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                # 输出所有层的梯度到writer
+                # for name, param in model.named_parameters():
+                #     if param.requires_grad and param.grad is not None:
+                #         writer.add_scalar(name + '_grad', param.grad.norm(), global_step)
+                optimizer.step()
+                if scheduler:scheduler.step()
 
-                    # 日志记录
-                    log_entry = {
-                        'global_step': global_step,
-                        'bce_loss': bce_loss.item(),
-                        'sim_loss': sim_loss.item(),
-                        'total_loss': total_loss.item(),
-                        'epoch': epoch,
-                        'time': time.time()
-                    }
-                    log_file.write(json.dumps(log_entry) + '\n')
-                    log_file.flush()
+                # 日志记录
+                log_entry = {
+                    'global_step': global_step,
+                    # 'bce_loss': bce_loss.item(),
+                    "infoNce_loss": infoNCE_loss.item(),
+                    "pos_sim": pos_sim.item(),
+                    "neg_sim": neg_sim.item(),
+                    'total_loss': total_loss.item(),
+                    'epoch': epoch,
+                    'time': time.time()
+                }
+                log_file.write(json.dumps(log_entry) + '\n')
+                log_file.flush()
 
-                    # TensorBoard
-                    writer.add_scalar('Loss/BCE', bce_loss.item(), global_step)
-                    writer.add_scalar('Loss/Sim', sim_loss.item(), global_step)
-                    writer.add_scalar('Loss/Total', total_loss.item(), global_step)
+                # TensorBoard
+                # writer.add_scalar('Loss/BCE', bce_loss.item(), global_step)
+                if global_step%100==0:
+                    writer.add_scalar('Train_Loss/infoNce_loss', infoNCE_loss.item(), global_step)
+                    writer.add_scalar('Train_Loss/pos_sim', pos_sim.item(), global_step)
+                    writer.add_scalar('Train_Loss/neg_sim', neg_sim.item(), global_step)
+                    writer.add_scalar('Train_Loss/Total', total_loss.item(), global_step)
                     writer.add_scalar('Learning Rate', optimizer.param_groups[0]['lr'], global_step)
-                    total_loss_epoch += total_loss.item()
-                    global_step += 1
+                    print(json.dumps(log_entry) + '\n')
+                total_loss_epoch += total_loss.item()
+                global_step += 1
 
-                    pbar.set_postfix({
-                        'bce': f'{bce_loss.item():.4f}',
-                        'sim': f'{sim_loss.item():.4f}'
-                    })
+                pbar.set_postfix({
+                    'infoNce_loss': f'{infoNCE_loss.item():.4f}',
+                })
 
-                except Exception as e:
-                    print(f"❌ 训练异常（跳过 batch）: {e}")
-                    continue  # 跳过当前 batch
+                # except Exception as e:
+                #     print(f"❌ 训练异常（跳过 batch）: {e}")
+                #     continue  # 跳过当前 batch
 
         avg_train_loss = total_loss_epoch / len(train_loader)
         print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Time: {time.time() - t0:.2f}s")
 
         # ========== 验证阶段 ==========
         model.eval()
-        val_loss_sum = 0.0
+        val_bce_loss_sum = 0.0
+        val_infoNCE_loss_sum = 0.0
+        val_pos_sim_sum = 0.0
+        val_neg_sim_sum = 0.0
         val_batches = 0
         with torch.no_grad():
             for batch in tqdm(valid_loader, desc="Validation", leave=False):
@@ -527,8 +572,9 @@ def train_downstream_model(model, train_loader, valid_loader, optimizer, args, l
                     pos = pos.to(args.device)
                     neg = neg.to(args.device)
                     next_token_type = next_token_type.to(args.device)
+                    next_action_type = next_action_type.to(args.device)
 
-                    pos_logits, neg_logits, sim_loss = model(
+                    pos_logits, neg_logits, infoNCE_loss, pos_sim, neg_sim = model(
                         seq, pos, neg, token_type, next_token_type, next_action_type,
                         seq_feat, pos_feat, neg_feat
                     )
@@ -537,59 +583,68 @@ def train_downstream_model(model, train_loader, valid_loader, optimizer, args, l
                     if not indices.any():
                         continue  # 跳过无目标动作的 batch
 
-                    loss_pos = bce_criterion(pos_logits[indices], torch.ones_like(pos_logits[indices]))
-                    loss_neg = bce_criterion(neg_logits[indices], torch.zeros_like(neg_logits[indices]))
-                    bce_loss = loss_pos + loss_neg
+                    # loss_pos = bce_criterion(pos_logits[indices], torch.ones_like(pos_logits[indices]))
+                    # loss_neg = bce_criterion(neg_logits[indices], torch.zeros_like(neg_logits[indices]))
+                    # bce_loss = loss_pos + loss_neg
+                    val_infoNCE_loss_sum += infoNCE_loss.item()
+                    val_pos_sim_sum += pos_sim.mean().item()
+                    val_neg_sim_sum += neg_sim.mean().item()
 
-                    val_loss_sum += bce_loss.item()
+
+                    # val_bce_loss_sum += bce_loss.item()
                     val_batches += 1
 
                 except Exception as e:
                     print(f"❌ 验证异常（跳过 batch）: {e}")
                     continue
 
-        avg_val_loss = val_loss_sum / val_batches if val_batches > 0 else float('inf')
-        writer.add_scalar('Loss/Valid', avg_val_loss, global_step)
-        print(f"Epoch {epoch} | Valid BCE Loss: {avg_val_loss:.4f}")
+        # avg_bce_val_loss = val_bce_loss_sum / val_batches if val_batches > 0 else float('inf')
+        # writer.add_scalar('Loss/BCE_loss', avg_bce_val_loss, global_step)
+        avg_infoNCE_loss = val_infoNCE_loss_sum / val_batches if val_batches > 0 else float('inf') 
+        avg_pos_sim = val_pos_sim_sum / val_batches if val_batches > 0 else float('inf')
+        avg_neg_sim = val_neg_sim_sum / val_batches if val_batches > 0 else float('inf')
+        writer.add_scalar('Eval_Loss/InfoNCE_loss', avg_infoNCE_loss, global_step)
+        writer.add_scalar('Eval_Loss/Pos_sim', avg_pos_sim, global_step)
+        writer.add_scalar('Eval_Loss/Neg_sim', avg_neg_sim, global_step)
+        # print(f"Epoch {epoch} | Valid BCE Loss: {avg_bce_val_loss:.4f}")
 
         # ✅ 学习率调度
         if scheduler is not None:
-            scheduler.step(avg_val_loss)
+            scheduler.step()
 
         # ✅ 保存最佳模型
-        ckpt_dir = Path(os.environ.get('TRAIN_CKPT_PATH')) / f"global_best_model"
-        cache_dir = Path(os.environ.get('USER_CACHE_PATH')) / f"global_best_model"
+        ckpt_dir = Path(os.environ.get('TRAIN_CKPT_PATH')) / f"global_step{global_step}.valid_loss={avg_infoNCE_loss:.4f}"
+        # cache_dir = Path(os.environ.get('USER_CACHE_PATH')) / f"global_step{global_step}.valid_loss={avg_infoNCE_loss:.4f}"
 
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        if avg_infoNCE_loss < best_val_loss:
+            best_val_loss = avg_infoNCE_loss
             no_improve_count = 0
 
-            for save_dir in [ckpt_dir, cache_dir]:
+            for save_dir in [ckpt_dir]:
                 save_dir.mkdir(parents=True, exist_ok=True)
                 torch.save(model.state_dict(), save_dir / "model.pt")
                 print(f"✅ 最佳模型已保存至: {save_dir / 'model.pt'}")
         else:
-            ckpt_dir = Path(os.environ.get('TRAIN_CKPT_PATH')) / f"global_step{global_step}_sim_model.valid_loss={avg_val_loss:.4f}"
+            save_dir = Path(os.environ.get('TRAIN_CKPT_PATH'), f"global_step{global_step}.valid_loss={avg_infoNCE_loss:.4f}")
+            save_dir.mkdir(parents=True, exist_ok=True)
             no_improve_count += 1
-            for save_dir in [ckpt_dir]:
-                save_dir.mkdir(parents=True, exist_ok=True)
-                torch.save(model.state_dict(), save_dir / "model.pt")
-                print(f"✅ 模型已保存至: {save_dir / 'model.pt'}")
+            torch.save(model.state_dict(), save_dir / "model.pt")
+            print(f"✅ 模型已保存至: {save_dir / 'model.pt'}")
         if test_dataset:
             eval_candidate_path = os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_eval.json')
             infer = Infer(args, model, eval_dataset=test_dataset, candidate_path=eval_candidate_path)
             hitrate_eval = infer.infer()
-            train_candidate_path = os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_train.json')
-            infer = Infer(args, model, eval_dataset=test_dataset_2, candidate_path=train_candidate_path)
-            hitrate_train = infer.infer()
+            # train_candidate_path = os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_train.json')
+            # infer = Infer(args, model, eval_dataset=test_dataset_2, candidate_path=train_candidate_path)
+            # hitrate_train = infer.infer()
 
             # 输出结果
             print("✅ 评估结果")
             print("eval:", hitrate_eval)
-            print("train:", hitrate_train)
+            # print("train:", hitrate_train)
             # 写入writer
             writer.add_scalar('HitRat/eval', hitrate_eval, global_step)
-            writer.add_scalar('HitRat/train', hitrate_train, global_step)
+            # writer.add_scalar('HitRat/train', hitrate_train, global_step)
     return model
 def main():
     set_seed(42)
@@ -605,16 +660,16 @@ def main():
     Path(os.environ['TRAIN_TF_EVENTS_PATH']).mkdir(parents=True, exist_ok=True)
 
     log_file = open(Path(os.environ['TRAIN_LOG_PATH']) / 'train.log', 'w')
-    writer = SummaryWriter(os.path.join(os.environ['TRAIN_TF_EVENTS_PATH'], time.strftime('%Y-%m-%d_%H-%M-%S')))
+    writer = SummaryWriter(os.environ['TRAIN_TF_EVENTS_PATH'])
 
     args = get_args()
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    args.device = device
 
     # 数据加载
     data_path = os.environ['TRAIN_DATA_PATH']
     base_dataset = BaseDataset(data_path, args)
-    train_idx, valid_idx = base_dataset.split_index([0.9, 0.1])
+    if args.train_data_size==-1:
+        args.train_data_size=None
+    train_idx, valid_idx = base_dataset.split_index([0.9, 0.1],args.train_data_size)
 
     # 构建嵌入训练与验证数据集
     train_emb_dataset = EmbeddingDataset(base_dataset, train_idx)
@@ -660,17 +715,9 @@ def main():
             writer=writer,
             log_file=log_file,
             final_save_dir=final_save_dir,
-            device='cuda'
+            device=args.device
         )
-    # 加载嵌入权重到下游模型（示例）
-    downstream_model = DownstreamModel(usernum, itemnum, feat_stats, feat_types, args).to(device)
 
-    if args.use_embedding_model:
-        try:
-            downstream_model.load_state_dict(torch.load(final_save_dir / "model.pt", map_location=device))
-            print("✅ 下游模型成功加载嵌入权重")
-        except Exception as e:
-            print(f"❌ 下游模型加载权重失败: {e}")
 
 
 
@@ -683,46 +730,54 @@ def main():
         train_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
-        collate_fn=train_dataset.collate_fn
+        collate_fn=train_dataset.collate_fn,
     )
     valid_loader = DataLoader(
         valid_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=0,
-        collate_fn=valid_dataset.collate_fn
+        collate_fn=valid_dataset.collate_fn,
     )
 
     # 模型初始化
     usernum, itemnum = base_dataset.usernum, base_dataset.itemnum
     feat_stats, feat_types = base_dataset.feat_statistics, base_dataset.feature_types
 
-    model = DownstreamModel(usernum, itemnum, feat_stats, feat_types, args).to(device)
-
+    # 加载嵌入权重到下游模型（示例）
+    downstream_model = DownstreamModel(usernum, itemnum, feat_stats, feat_types, args).to(args.device)
     # 加载预训练 embedding（可选）
     if args.state_dict_path:
         try:
-            model.load_state_dict(torch.load(args.state_dict_path, map_location=device))
+            downstream_model.load_state_dict(torch.load(args.state_dict_path, map_location=args.device))
             print(f"✅ 已加载预训练权重: {args.state_dict_path}")
         except Exception as e:
             print(f"⚠️ 权重加载失败: {e}")
 
+    if args.use_embedding_model:
+        try:
+            downstream_model.embedding_layer.load_state_dict(torch.load(final_save_dir / "model.pt", map_location=args.device))
+            # 冻结预训练 embedding
+            for name, param in downstream_model.embedding_layer.named_parameters():
+                param.requires_grad = False
+            print("✅ 下游模型成功加载嵌入权重")
+        except Exception as e:
+            print(f"❌ 下游模型加载权重失败: {e}")
+
     # 优化器与损失
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98))
+    optimizer = torch.optim.Adam(downstream_model.parameters(), lr=args.downstream_task_lr, betas=(0.9, 0.98), weight_decay=getattr(args, 'weight_decay', 0.0))
     bce_criterion = nn.BCEWithLogitsLoss(reduction='mean')
 
     # 开始训练
-    train_downstream_model(model, train_loader, valid_loader, optimizer, args, log_file, writer,test_dataset, test_dataset_2)
+    train_downstream_model(downstream_model, train_loader, valid_loader, optimizer, args, log_file, writer,test_dataset, test_dataset_2)
 
    
     
     eval_candidate_path = os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_eval.json')
-    infer = Infer(args, model, eval_dataset=test_dataset, candidate_path=eval_candidate_path)
+    infer = Infer(args, downstream_model, eval_dataset=test_dataset, candidate_path=eval_candidate_path)
     hitrate_eval = infer.infer()
     print("✅ 推理完成")
     train_candidate_path = os.path.join(os.environ['TEMP_PATH'], 'item_feat_dict_train.json')
-    infer = Infer(args, model, eval_dataset=test_dataset_2, candidate_path=train_candidate_path)
+    infer = Infer(args, downstream_model, eval_dataset=test_dataset_2, candidate_path=train_candidate_path)
     hitrate_train = infer.infer()
 
     # 输出结果
@@ -735,3 +790,14 @@ def main():
     
 if __name__ == '__main__':
     main()
+
+
+# eval: 0.47674418604651164
+# train: 0.3856041131105398
+# Epoch 9 | Train Loss: 3.5280 | Time: 15.93s
+
+
+# -105  特征
+# eval: 0.5116279069767442
+# train: 0.794344473007712
+# Epoch 13 | Train Loss: 2.5730 | Time: 16.76s

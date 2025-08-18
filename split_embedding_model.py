@@ -1,3 +1,4 @@
+# split_embedding_model.py
 from pathlib import Path
 
 import numpy as np
@@ -9,7 +10,7 @@ from dataset import save_emb
 import torch
 import torch.nn.functional as F
 
-def info_nce_loss(anchor, positive, negatives=None,weight=None, temperature=0.1, use_inbatch_negatives=True):
+def info_nce_loss(anchor, positive, negatives=None,weight=None, temperature=0.07, use_inbatch_negatives=True):
     """
     InfoNCE Loss 支持：
     - 显式负样本 (negatives)
@@ -47,13 +48,13 @@ def info_nce_loss(anchor, positive, negatives=None,weight=None, temperature=0.1,
         neg_sim_list.append(explicit_neg_sim)
 
     # batch 内负样本: anchor 与所有 positive 的相似度，去掉对角线（自己）
-    # if use_inbatch_negatives:
-    #     # 计算 anchor 与所有 positive 的相似度（包括自己）
-    #     inbatch_sim = torch.matmul(anchor, positive.T)  # (N, N)
-    #     # 创建 mask，去掉对角线（正样本）
-    #     mask = torch.eye(batch_size, dtype=torch.bool, device=device)
-    #     inbatch_neg_sim = inbatch_sim.masked_select(~mask).view(batch_size, -1)  # (N, N-1)
-    #     neg_sim_list.append(inbatch_neg_sim)
+    if use_inbatch_negatives:
+        # 计算 anchor 与所有 positive 的相似度（包括自己）
+        inbatch_sim = torch.matmul(anchor, positive.T)  # (N, N)
+        # 创建 mask，去掉对角线（正样本）
+        mask = torch.eye(batch_size, dtype=torch.bool, device=device)
+        inbatch_neg_sim = inbatch_sim.masked_select(~mask).view(batch_size, -1)  # (N, N-1)
+        neg_sim_list.append(inbatch_neg_sim)
 
     # 拼接所有负样本相似度
     if neg_sim_list:
@@ -88,6 +89,8 @@ def cosine_similarity_loss(a, b):
     loss = 1 - cos_sim
     
     return loss
+
+
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, hidden_size, eps=1e-8):
@@ -172,7 +175,7 @@ class PointWiseFeedForward(torch.nn.Module):
         return outputs
 
 
-class BaselineModel(torch.nn.Module):
+class ADEmbeddingLayer(torch.nn.Module):
     """
     Args:
         user_num: 用户数量
@@ -194,9 +197,8 @@ class BaselineModel(torch.nn.Module):
         userdnn: 用户特征拼接后经过的全连接层
         itemdnn: 物品特征拼接后经过的全连接层
     """
-
     def __init__(self, user_num, item_num, feat_statistics, feat_types, args):  #
-        super(BaselineModel, self).__init__()
+        super(ADEmbeddingLayer, self).__init__()
 
         self.user_num = user_num
         self.item_num = item_num
@@ -204,20 +206,14 @@ class BaselineModel(torch.nn.Module):
         self.norm_first = args.norm_first
         self.maxlen = args.maxlen
         # TODO: loss += args.l2_emb for regularizing embedding vectors during training
-        # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch
+        # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch    
 
         self.item_emb = torch.nn.Embedding(self.item_num + 1, args.hidden_units, padding_idx=0)
         self.user_emb = torch.nn.Embedding(self.user_num + 1, args.hidden_units, padding_idx=0)
-        self.pos_emb = torch.nn.Embedding(2 * args.maxlen + 1, args.hidden_units, padding_idx=0)
         self.emb_dropout = torch.nn.Dropout(p=args.dropout_rate)
         self.sparse_emb = torch.nn.ModuleDict()
         self.emb_transform = torch.nn.ModuleDict()
-
-        self.attention_layernorms = torch.nn.ModuleList()  # to be Q for self-attention
-        self.attention_layers = torch.nn.ModuleList()
-        self.forward_layernorms = torch.nn.ModuleList()
-        self.forward_layers = torch.nn.ModuleList()
-
+        self.hidden_units = args.hidden_units
         self._init_feat_info(feat_statistics, feat_types)
 
         userdim = args.hidden_units * (len(self.USER_SPARSE_FEAT) + 1 + len(self.USER_ARRAY_FEAT)) + len(
@@ -228,26 +224,10 @@ class BaselineModel(torch.nn.Module):
             + len(self.ITEM_CONTINUAL_FEAT)
             + args.hidden_units * len(self.ITEM_EMB_FEAT)
         )
-
+    
         self.userdnn = torch.nn.Linear(userdim, args.hidden_units)
         self.itemdnn = torch.nn.Linear(itemdim, args.hidden_units)
-
         self.last_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
-
-        for _ in range(args.num_blocks):
-            new_attn_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
-            self.attention_layernorms.append(new_attn_layernorm)
-
-            new_attn_layer = FlashMultiHeadAttention(
-                args.hidden_units, args.num_heads, args.dropout_rate
-            )  # 优化：用FlashAttention替代标准Attention
-            self.attention_layers.append(new_attn_layer)
-
-            new_fwd_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
-            self.forward_layernorms.append(new_fwd_layernorm)
-
-            new_fwd_layer = PointWiseFeedForward(args.hidden_units, args.dropout_rate)
-            self.forward_layers.append(new_fwd_layer)
 
         for k in self.USER_SPARSE_FEAT:
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_SPARSE_FEAT[k] + 1, args.hidden_units, padding_idx=0)
@@ -259,8 +239,7 @@ class BaselineModel(torch.nn.Module):
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_EMB_FEAT:
             self.emb_transform[k] = torch.nn.Linear(self.ITEM_EMB_FEAT[k], args.hidden_units)
-        self.sample_index = []
-    
+
 
     def _init_feat_info(self, feat_statistics, feat_types):
         """
@@ -319,7 +298,7 @@ class BaselineModel(torch.nn.Module):
 
             return torch.from_numpy(batch_data).to(self.dev)
 
-    def feat2emb(self, seq, feature_array, mask=None, include_user=False):
+    def forward(self, seq, feature_array, mask=None, include_user=False):
         """
         Args:
             seq: 序列ID
@@ -401,8 +380,84 @@ class BaselineModel(torch.nn.Module):
             seqs_emb = all_item_emb + all_user_emb
         else:
             seqs_emb = all_item_emb
+        seqs_emb = self.emb_dropout(seqs_emb)
         seqs_emb = F.normalize(seqs_emb,dim=-1)
         return seqs_emb
+
+    def lunif(x, t=2):
+        sq_pdist = torch.pdist(x, p=2).pow(2)
+        return sq_pdist.mul(-t).exp().mean().log()
+    @staticmethod
+    def embedding_loss(input_embedding, positive, negatives=None):
+        """
+        计算embedding loss
+        Args:
+            input_embedding: shape [batch, sample, hidden]
+            positive: shape [batch, sample, hidden]
+            negatives: shape [batch, sample, neg_num, hidden]
+        """
+        return info_nce_loss(input_embedding, positive, negatives)
+    
+
+class BaselineModel(torch.nn.Module):
+    """
+    Args:
+        user_num: 用户数量
+        item_num: 物品数量
+        feat_statistics: 特征统计信息，key为特征ID，value为特征数量
+        feat_types: 各个特征的特征类型，key为特征类型名称，value为包含的特征ID列表，包括user和item的sparse, array, emb, continual类型
+        args: 全局参数
+
+    Attributes:
+        user_num: 用户数量
+        item_num: 物品数量
+        dev: 设备
+        norm_first: 是否先归一化
+        maxlen: 序列最大长度
+        item_emb: Item Embedding Table
+        user_emb: User Embedding Table
+        sparse_emb: 稀疏特征Embedding Table
+        emb_transform: 多模态特征的线性变换
+        userdnn: 用户特征拼接后经过的全连接层
+        itemdnn: 物品特征拼接后经过的全连接层
+    """
+
+    def __init__(self, user_num, item_num, feat_statistics, feat_types, args):  #
+        super(BaselineModel, self).__init__()
+        self.embedding_layer = ADEmbeddingLayer(user_num, item_num, feat_statistics, feat_types, args)
+        self.dev = args.device
+        self.norm_first = args.norm_first
+        self.maxlen = args.maxlen
+        # TODO: loss += args.l2_emb for regularizing embedding vectors during training
+        # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch    
+
+        self.pos_emb = torch.nn.Embedding(2 * args.maxlen + 1, args.hidden_units, padding_idx=0)
+        self.attention_layernorms = torch.nn.ModuleList()  # to be Q for self-attention
+        self.attention_layers = torch.nn.ModuleList()
+        self.forward_layernorms = torch.nn.ModuleList()
+        self.forward_layers = torch.nn.ModuleList()
+        self.hidden_units = args.hidden_units
+        self.last_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
+        # predict model
+        for _ in range(args.num_blocks):
+            new_attn_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
+            self.attention_layernorms.append(new_attn_layernorm)
+
+            new_attn_layer = FlashMultiHeadAttention(
+                args.hidden_units, args.num_heads, args.dropout_rate
+            )  # 优化：用FlashAttention替代标准Attention
+            self.attention_layers.append(new_attn_layer)
+
+            new_fwd_layernorm = torch.nn.LayerNorm(args.hidden_units, eps=1e-8)
+            self.forward_layernorms.append(new_fwd_layernorm)
+
+            new_fwd_layer = PointWiseFeedForward(args.hidden_units, args.dropout_rate)
+            self.forward_layers.append(new_fwd_layer)
+    
+    def feat2emb(self, seq, feature_array, mask=None, include_user=False):
+        return self.embedding_layer(seq, feature_array, mask, include_user)
+
+
 
     def log2feats(self, log_seqs, mask, seq_feature):
         """
@@ -414,13 +469,9 @@ class BaselineModel(torch.nn.Module):
         Returns:
             seqs_emb: 序列的Embedding，形状为 [batch_size, maxlen, hidden_units]
         """
-        batch_size = log_seqs.shape[0]
         maxlen = log_seqs.shape[1]
         seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True)
-        seqs *= self.item_emb.embedding_dim**0.5
-        # 位置偏移有问题，需要从有值的位置开始
-        # 创建基础位置矩阵：[[1,2,3,4,5], [1,2,3,4,5], ...]
-        batch_size = log_seqs.shape[0]
+        seqs *= self.hidden_units**0.5
 
         # --- Left Padding 位置编码 ---
         valid_mask = (log_seqs != 0)  # [batch_size, maxlen]
@@ -431,7 +482,6 @@ class BaselineModel(torch.nn.Module):
         # poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
         # poss *= log_seqs != 0
         seqs += self.pos_emb(poss)
-        seqs = self.emb_dropout(seqs)
 
         maxlen = seqs.shape[1]
         ones_matrix = torch.ones((maxlen, maxlen), dtype=torch.bool, device=self.dev)
@@ -499,12 +549,12 @@ class BaselineModel(torch.nn.Module):
         neg_logits = neg_logits * loss_mask.unsqueeze(1)
         log_feats = log_feats[loss_mask]
         pos_embs = pos_embs[loss_mask]
-        neg_embs = neg_embs[loss_mask.unsqueeze(1).expand(-1, neg_embs_number, -1)].reshape(pos_embs.shape[0],-1,pos_embs.shape[-1])
+        neg_embs = neg_embs[loss_mask.unsqueeze(1).expand(-1,neg_embs_number, -1)].reshape(pos_embs.shape[0],-1,pos_embs.shape[-1])
         weight = (next_action_type[loss_mask]+1)*0.5
-        infonce_loss,pos_sim,neg_sim = info_nce_loss(log_feats,pos_embs,neg_embs,weight)
+        infonce_loss, pos_sim, neg_sim = info_nce_loss(log_feats,pos_embs,neg_embs,weight)
         
         
-        return pos_logits, neg_logits, infonce_loss,pos_sim,neg_sim
+        return pos_logits, neg_logits, infonce_loss, pos_sim, neg_sim
 
     def predict(self, log_seqs, seq_feature, mask):
         """

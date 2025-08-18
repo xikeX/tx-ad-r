@@ -148,9 +148,10 @@ class BaseDataset():
         for feat_id in missing_fields:
             filled_feat[feat_id] = self.feature_default_value[feat_id]
         for feat_id in self.feature_types['item_emb']:
-            if item_id != 0 and self.indexer_i_rev[item_id] in self.mm_emb_dict[feat_id]:
-                if type(self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]) == np.ndarray:
-                    filled_feat[feat_id] = self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]
+            if item_id != 0:
+                if self.indexer_i_rev[item_id] in self.mm_emb_dict[feat_id]:
+                    if type(self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]) == np.ndarray:
+                        filled_feat[feat_id] = self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]
 
         return filled_feat
 
@@ -197,15 +198,16 @@ class BaseDataset():
     def __len__(self):
         return len(self.seq_offsets)
 
-    def split_index(self,probs,shuffle=True):
+    def split_index(self,probs,total_data_size=None,shuffle=True):
         split_size = len(probs)
-        split_index = list(range(len(self)))
+        data_len = total_data_size if total_data_size else len(self)
+        split_index = list(range(data_len))
         if shuffle:
             random.shuffle(split_index)
         res = []
         start = 0
         for prob in probs:
-            data_size = int(len(self)*prob)
+            data_size = int(data_len*prob)
             res.append(split_index[start:start+data_size])
             start += data_size
         return res
@@ -254,7 +256,7 @@ def load_mm_emb(mm_path, feat_ids):
                         for line in f:
                             line = json.loads(line)
                             if 'emb' in line:
-                                emb_dict[line['anonymous_cid']] = torch.tensor(line['emb'])
+                                emb_dict[line['anonymous_cid']] = np.array(line['emb'])
         mm_emb_dict[feat_id] = emb_dict
         print(f'Loaded #{feat_id} mm_emb')
     return mm_emb_dict
@@ -263,11 +265,12 @@ class TrainDataset(torch.utils.data.Dataset):
     base_dataset:BaseDataset # 基础数据集（防止深拷贝）
     sample_index:list # 样本索引
     max_padding_size:int # 最大长度
-    def __init__(self, base_dataset, sample_index=[], max_padding_size=100):
+    def __init__(self, base_dataset, sample_index=[], neg_sample_size = 1, max_padding_size=100):
         super().__init__()
         self.base_dataset = base_dataset
         self.sample_index = sample_index # 采样索引
         self.max_padding_size = max_padding_size
+        self.neg_sample_size = neg_sample_size
 
     def __getitem__(self, index):
         uid = self.sample_index[index]
@@ -278,16 +281,27 @@ class TrainDataset(torch.utils.data.Dataset):
     def build_example(self, user_sequence):
         # 构建训练样本
         ext_user_sequence = []
+        explore_unlick_sample_index = []
+        cur_u, cur_user_feat, cur_action_type = None,None,None
         for record_tuple in user_sequence:
             u, i, user_feat, item_feat, action_type, timestamp = record_tuple
             if u and user_feat:
-                ext_user_sequence.insert(0, (u, user_feat, 2, action_type)) # 插入第一位
+                # ext_user_sequence.insert(0, (u, user_feat, 2, action_type)) # 插入第一位
+                cur_u, cur_user_feat, cur_action_type = u, user_feat, action_type
             if i and item_feat:
                 ext_user_sequence.append((i, item_feat, 1, action_type))
-
+                if action_type==0:
+                    explore_unlick_sample_index.append(len(ext_user_sequence)-1)
+        if len(explore_unlick_sample_index)>2:
+            while random.random()<0.2:
+                a = random.choice(explore_unlick_sample_index)
+                b = random.choice(explore_unlick_sample_index)
+                ext_user_sequence[a], ext_user_sequence[b] = ext_user_sequence[b], ext_user_sequence[a]
+        if cur_u!=None: # 插入用户
+            ext_user_sequence.insert(0, (cur_u, cur_user_feat, 2, cur_action_type))
         seq = np.zeros([self.max_padding_size + 1], dtype=np.int32) # 输入序列
         pos = np.zeros([self.max_padding_size + 1], dtype=np.int32) # 正样本序列
-        neg = np.zeros([self.max_padding_size + 1], dtype=np.int32) # 负样本序列
+        neg = np.zeros([(self.max_padding_size + 1) * self.neg_sample_size], dtype=np.int32) # 负样本序列
         
         token_type = np.zeros([self.max_padding_size + 1], dtype=np.int32) # 是用户还是商品 0/1/2
         next_token_type = np.zeros([self.max_padding_size + 1], dtype=np.int32)
@@ -295,7 +309,7 @@ class TrainDataset(torch.utils.data.Dataset):
 
         seq_feat = np.empty([self.max_padding_size + 1], dtype=object)
         pos_feat = np.empty([self.max_padding_size + 1], dtype=object)
-        neg_feat = np.empty([self.max_padding_size + 1], dtype=object)
+        neg_feat = np.empty([(self.max_padding_size + 1) * self.neg_sample_size], dtype=object)
 
         idx = self.max_padding_size
 
@@ -321,9 +335,10 @@ class TrainDataset(torch.utils.data.Dataset):
                 pos[idx] = next_i
                 pos_feat[idx] = next_feat
                 # 总感觉这样采样不合适，自回归模型基本没有这样采样的方式
-                neg_id = self.base_dataset._random_neq(1, self.base_dataset.itemnum + 1, ts)
-                neg[idx] = neg_id
-                neg_feat[idx] = self.base_dataset.fill_missing_feat(self.base_dataset.item_feat_dict[str(neg_id)], neg_id)
+                for j in range( self.neg_sample_size):
+                    neg_id = self.base_dataset._random_neq(1, self.base_dataset.itemnum + 1, ts)
+                    neg[idx + self.max_padding_size * j] = neg_id
+                    neg_feat[idx + self.max_padding_size * j] = self.base_dataset.fill_missing_feat(self.base_dataset.item_feat_dict[str(neg_id)], neg_id)
 
             next_i, next_feat, next_type, next_act_type, next_feat = \
                 i, feat, type_, act_type, feat
@@ -395,7 +410,7 @@ class ValidDataset(torch.utils.data.Dataset):
 
         ext_user_sequence = []
         for record_tuple in user_sequence:
-            u, i, user_feat, item_feat, _, _ = record_tuple
+            u, i, user_feat, item_feat, action_type, _ = record_tuple
             if u:
                 if type(u) == str:  # 如果是字符串，说明是user_id
                     user_id = u
@@ -406,7 +421,7 @@ class ValidDataset(torch.utils.data.Dataset):
                     u = 0
                 if user_feat:
                     user_feat = self.base_dataset._process_cold_start_feat(user_feat)
-                ext_user_sequence.insert(0, (u, user_feat, 2))
+                ext_user_sequence.insert(0, (u, user_feat, 2, action_type))
 
             if i and item_feat:
                 # 序列对于训练时没见过的item，不会直接赋0，而是保留creative_id，creative_id远大于训练时的itemnum
@@ -414,8 +429,13 @@ class ValidDataset(torch.utils.data.Dataset):
                     i = 0
                 if item_feat:
                     item_feat = self.base_dataset._process_cold_start_feat(item_feat)
-                ext_user_sequence.append((i, item_feat, 1))
-
+                ext_user_sequence.append((i, item_feat, 1,action_type))
+        last_index_action_type_eq_1 = None
+        for index,item in enumerate(ext_user_sequence):
+            if item[-1]==1:
+                last_index_action_type_eq_1=index
+        if last_index_action_type_eq_1:
+            ext_user_sequence = ext_user_sequence[:last_index_action_type_eq_1+1]
         seq = np.zeros([self.max_padding_size + 1], dtype=np.int32)
         token_type = np.zeros([self.max_padding_size + 1], dtype=np.int32)
         seq_feat = np.empty([self.max_padding_size + 1], dtype=object)
@@ -428,7 +448,7 @@ class ValidDataset(torch.utils.data.Dataset):
                 ts.add(record_tuple[0])
 
         for record_tuple in reversed(ext_user_sequence[:-1]):
-            i, feat, type_ = record_tuple
+            i, feat, type_,_ = record_tuple
             feat = self.base_dataset.fill_missing_feat(feat, i)
             seq[idx] = i
             token_type[idx] = type_
@@ -471,7 +491,7 @@ class EmbeddingDataset(torch.utils.data.IterableDataset):
     max_padding_size:int # 最大长度
     feature_map:dict
 
-    def __init__(self, base_dataset, sample_index=[], max_padding_size=100,max_cache_size=100000):
+    def __init__(self, base_dataset, sample_index=[], max_padding_size=100, neg_sample_size = 2, max_cache_size=100000):
         super().__init__()
         self.base_dataset = base_dataset
         self.sample_index = sample_index # 采样索引
@@ -482,6 +502,7 @@ class EmbeddingDataset(torch.utils.data.IterableDataset):
         self.cache = []
         self.cache_index = 0
         self.max_cache_size = max_cache_size
+        self.neg_sample_size = neg_sample_size
 
     def __iter__(self):
         while True:
@@ -495,17 +516,14 @@ class EmbeddingDataset(torch.utils.data.IterableDataset):
                     break
                 res = self.cache[self.cache_index]
             self.cache_index += 1
-            u, pos1, pos2, neg1 = res
+            u, pos1, pos2, neg1_list = res
             user_feat = self.feature_map[u]
             pos1_feat = self.feature_map[pos1]
             pos2_feat = self.feature_map[pos2]
-            neg1_feat = self.feature_map[neg1]
-            yield  u, pos1, pos2, neg1, user_feat, pos1_feat, pos2_feat, neg1_feat
-    def __getitem__(self, index):
-        uid = self.sample_index[index]
-        user_sequence = self.base_dataset._load_user_data(uid)
-        
-        self.build_example_cache(user_sequence)
+            neg1_feat_list = []
+            for neg1 in neg1_list:
+                neg1_feat_list.append(self.feature_map[neg1])
+            yield  u, pos1, pos2, neg1_list, user_feat, pos1_feat, pos2_feat, neg1_feat_list
     
     def build_example_cache(self):
         self.cache = []
@@ -541,14 +559,17 @@ class EmbeddingDataset(torch.utils.data.IterableDataset):
             for cur,item_index in enumerate(click_item_sequence[:-1]):
                 pos1 = item_index
                 pos2 = click_item_sequence[cur+1]
-                neg1 = self.base_dataset._random_neq(1, self.base_dataset.itemnum + 1, ts) # 随机采集负样本
-                if random.random() < 0.01:
-                    # 难样本
-                    neg1 = random.choice(explore_item_sequence)
-                
-                if neg1 not in self.feature_map:
-                    self.feature_map[neg1] = self.base_dataset.fill_missing_feat(self.base_dataset.item_feat_dict[str(neg1)],neg1)
-                data_pairs.append((cur_u, pos1, pos2, neg1))
+                neg1_list = []
+                for _ in range(self.neg_sample_size):
+                    neg1 = self.base_dataset._random_neq(1, self.base_dataset.itemnum + 1, ts) # 随机采集负样本
+                    if random.random() < 0.01:
+                        # 难样本
+                        neg1 = random.choice(explore_item_sequence)
+                    
+                    if neg1 not in self.feature_map:
+                        self.feature_map[neg1] = self.base_dataset.fill_missing_feat(self.base_dataset.item_feat_dict[str(neg1)],neg1)
+                    neg1_list.append(neg1)
+                data_pairs.append((cur_u, pos1, pos2, neg1_list))
             self.cache.extend(data_pairs)
             # print(f"process {len(self.cache)}/{self.max_cache_size}")
         random.shuffle(self.cache)
@@ -567,16 +588,16 @@ class EmbeddingDataset(torch.utils.data.IterableDataset):
             seq_feat: 用户序列特征, list形式
             user_id: user_id, str
         """
-        user, input_item, pos1_item, neg1_item, user_featrue, input_item_feature, pos1_item_feature, neg1_item_feature = zip(*batch)
+        user, input_item, pos1_item, neg1_item_list, user_featrue, input_item_feature, pos1_item_feature, neg1_item_feature_list = zip(*batch)
         # seq = torch.from_numpy(np.array(seq))
         # token_type = torch.from_numpy(np.array(token_type))
         # seq_feat = list(seq_feat)
-        user = torch.tensor(user)
-        input_item = torch.tensor(input_item)
-        pos1_item = torch.tensor(pos1_item)
-        neg1_item = torch.tensor(neg1_item)
-        user_featrue = list(user_featrue)
-        input_item_feature = list(input_item_feature)
-        pos1_item_feature = list(pos1_item_feature)
-        neg1_item_feature = list(neg1_item_feature)
-        return user, input_item, pos1_item, neg1_item, user_featrue, input_item_feature, pos1_item_feature, neg1_item_feature
+        user = torch.tensor(user).unsqueeze(0)
+        input_item = torch.tensor(input_item).unsqueeze(0)
+        pos1_item = torch.tensor(pos1_item).unsqueeze(0)
+        neg1_item_list = torch.tensor(neg1_item_list)
+        user_featrue = [list(user_featrue)]
+        input_item_feature = [list(input_item_feature)]
+        pos1_item_feature = [list(pos1_item_feature)]
+        neg1_item_feature_list = list(neg1_item_feature_list)
+        return user, input_item, pos1_item, neg1_item_list, user_featrue, input_item_feature, pos1_item_feature, neg1_item_feature_list
