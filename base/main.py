@@ -113,10 +113,11 @@ if __name__ == '__main__':
             pos_labels, neg_labels = torch.ones(pos_logits.shape, device=args.device), torch.zeros(
                 neg_logits.shape, device=args.device
             )
-            optimizer.zero_grad()
             indices = np.where(next_token_type == 1)
             loss = bce_criterion(pos_logits[indices], pos_labels[indices])
             loss += bce_criterion(neg_logits[indices], neg_labels[indices])
+            optimizer.zero_grad()
+
 
             log_json = json.dumps(
                 {'global_step': global_step, 'loss': loss.item(), 'epoch': epoch, 'time': time.time()}

@@ -166,6 +166,7 @@ class BaselineModel(torch.nn.Module):
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_EMB_FEAT:
             self.emb_transform[k] = torch.nn.Linear(self.ITEM_EMB_FEAT[k], args.hidden_units)
+        self.bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
 
     def _init_feat_info(self, feat_statistics, feat_types):
         """
@@ -345,7 +346,6 @@ class BaselineModel(torch.nn.Module):
                 seqs = self.forward_layernorms[i](seqs + self.forward_layers[i](seqs))
 
         log_feats = self.last_layernorm(seqs)
-
         return log_feats
 
     def forward(
@@ -379,9 +379,19 @@ class BaselineModel(torch.nn.Module):
         neg_logits = (log_feats * neg_embs).sum(dim=-1)
         pos_logits = pos_logits * loss_mask
         neg_logits = neg_logits * loss_mask
+        loss = self.loss(pos_logits, neg_logits, next_mask)
+        return {
+            "loss":loss,
+        }
 
-        return pos_logits, neg_logits
-
+    def loss(self, pos_logits, neg_logits, next_token_type):
+        pos_labels, neg_labels = torch.ones(pos_logits.shape, device=args.device), torch.zeros(
+            neg_logits.shape, device=pos_logits.device
+        )
+        indices = np.where(next_token_type == 1)
+        loss = self.bce_criterion(pos_logits[indices], pos_labels[indices])
+        loss += self.bce_criterion(neg_logits[indices], neg_labels[indices])
+        
     def predict(self, log_seqs, seq_feature, mask):
         """
         计算用户序列的表征

@@ -458,11 +458,9 @@ def train_downstream_model(model, train_loader, valid_loader, optimizer, args, l
 
         with tqdm(train_loader, desc=f"Epoch {epoch}", leave=False) as pbar:
             for step, batch in enumerate(pbar):
-                # try:
                 # 解包数据
                 seq, pos, neg, token_type, next_token_type, next_action_type, \
                 seq_feat, pos_feat, neg_feat = batch
-
                 # 移动到设备
                 seq = seq.to(args.device)
                 pos = pos.to(args.device)
@@ -470,26 +468,13 @@ def train_downstream_model(model, train_loader, valid_loader, optimizer, args, l
                 token_type = token_type.to(args.device)
                 next_token_type = next_token_type.to(args.device)
                 next_action_type = next_action_type.to(args.device)
-                # seq_feat = seq_feat.to(args.device)
-                # pos_feat = pos_feat.to(args.device)
-                # neg_feat = neg_feat.to(args.device)
 
                 # 前向传播
-                pos_logits, neg_logits, infoNCE_loss, pos_sim, neg_sim = model(
+                output = model(
                     seq, pos, neg, token_type, next_token_type, next_action_type,
                     seq_feat, pos_feat, neg_feat
                 )
-
-                # 只对 next_token_type == 1 的位置计算损失
-                indices = (next_token_type == 1)  # [B, L]
-
-                # 使用 BCEWithLogitsLoss（自带 sigmoid，数值更稳定）
-                # loss_pos = bce_criterion(pos_logits[indices], torch.ones_like(pos_logits[indices]))
-                # loss_neg = bce_criterion(neg_logits[indices], torch.zeros_like(neg_logits[indices]))
-                # bce_loss = loss_pos + loss_neg
-
-
-                total_loss = infoNCE_loss 
+                total_loss = output['total_loss'] 
 
                 # L2 正则化（仅 item_emb）
                 if args.l2_emb > 0:
@@ -521,10 +506,6 @@ def train_downstream_model(model, train_loader, valid_loader, optimizer, args, l
                 # 日志记录
                 log_entry = {
                     'global_step': global_step,
-                    # 'bce_loss': bce_loss.item(),
-                    "infoNce_loss": infoNCE_loss.item(),
-                    "pos_sim": pos_sim.item(),
-                    "neg_sim": neg_sim.item(),
                     'total_loss': total_loss.item(),
                     'epoch': epoch,
                     'time': time.time()
@@ -535,22 +516,18 @@ def train_downstream_model(model, train_loader, valid_loader, optimizer, args, l
                 # TensorBoard
                 # writer.add_scalar('Loss/BCE', bce_loss.item(), global_step)
                 if global_step%100==0:
-                    writer.add_scalar('Train_Loss/infoNce_loss', infoNCE_loss.item(), global_step)
-                    writer.add_scalar('Train_Loss/pos_sim', pos_sim.item(), global_step)
-                    writer.add_scalar('Train_Loss/neg_sim', neg_sim.item(), global_step)
-                    writer.add_scalar('Train_Loss/Total', total_loss.item(), global_step)
+                    msg = f"lr:{optimizer.param_groups[0]['lr']:0.5f}"
                     writer.add_scalar('Learning Rate', optimizer.param_groups[0]['lr'], global_step)
-                    print(json.dumps(log_entry) + '\n')
+                    if hasattr(model,'train_record'):
+                        for record_key in model.train_record:
+                            writer.add_scalar(f'Train/{record_key}', output[record_key], global_step)
+                            msg += f" {record_key}:{output[record_key]:0.5f}"
+                    print(msg + '\n')
                 total_loss_epoch += total_loss.item()
                 global_step += 1
-
                 pbar.set_postfix({
                     'infoNce_loss': f'{infoNCE_loss.item():.4f}',
                 })
-
-                # except Exception as e:
-                #     print(f"❌ 训练异常（跳过 batch）: {e}")
-                #     continue  # 跳过当前 batch
 
         avg_train_loss = total_loss_epoch / len(train_loader)
         print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Time: {time.time() - t0:.2f}s")
@@ -574,18 +551,12 @@ def train_downstream_model(model, train_loader, valid_loader, optimizer, args, l
                     next_token_type = next_token_type.to(args.device)
                     next_action_type = next_action_type.to(args.device)
 
-                    pos_logits, neg_logits, infoNCE_loss, pos_sim, neg_sim = model(
+                    output = model(
                         seq, pos, neg, token_type, next_token_type, next_action_type,
                         seq_feat, pos_feat, neg_feat
                     )
+                    total_loss = output['total_loss']
 
-                    indices = (next_token_type == 1)
-                    if not indices.any():
-                        continue  # 跳过无目标动作的 batch
-
-                    # loss_pos = bce_criterion(pos_logits[indices], torch.ones_like(pos_logits[indices]))
-                    # loss_neg = bce_criterion(neg_logits[indices], torch.zeros_like(neg_logits[indices]))
-                    # bce_loss = loss_pos + loss_neg
                     val_infoNCE_loss_sum += infoNCE_loss.item()
                     val_pos_sim_sum += pos_sim.mean().item()
                     val_neg_sim_sum += neg_sim.mean().item()
