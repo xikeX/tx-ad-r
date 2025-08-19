@@ -80,11 +80,11 @@ class Infer:
                 all_embs.append(emb)
             user_list.extend(user_id)
             labels.extend([i[0] for i in label])
-        all_embs = np.concatenate(all_embs, axis=0)
-        save_emb(all_embs, Path(os.environ.get('EVAL_RESULT_PATH'), 'query.fbin'))
+        query_vector = np.concatenate(all_embs, axis=0)
+        save_emb(query_vector, Path(os.environ.get('EVAL_RESULT_PATH'), 'query.fbin'))
 
         # 构建找回池query的向量，返回query词的物品id
-        item_ids = self.get_candidate_emb()
+        item_ids, dataset_vector,dataset_id = self.get_candidate_emb()
         # ann_cmd = (
         #     str(Path("/workspace", "faiss-based-ann", "faiss_demo"))
         #     + " --dataset_vector_file_path="
@@ -97,21 +97,21 @@ class Infer:
         #     + str(Path(os.environ.get("EVAL_RESULT_PATH"), "id100.u64bin"))
         #     + " --query_ann_top_k=10 --faiss_M=64 --faiss_ef_construction=1280 --query_ef_search=640 --faiss_metric_type=0"
         # )
-        run_faiss_ann_search(
-            dataset_vector_file_path = str(Path(os.environ.get("EVAL_RESULT_PATH"), "embedding.fbin")),
-            dataset_id_file_path = str(Path(os.environ.get("EVAL_RESULT_PATH"), "id.u64bin")),
-            query_vector_file_path = str(Path(os.environ.get("EVAL_RESULT_PATH"), "query.fbin")),
-            result_id_file_path = str(Path(os.environ.get("EVAL_RESULT_PATH"), "id100.u64bin")),
+        top10s_retrieved = run_faiss_ann_search(
+            dataset_vector = dataset_vector,
+            dataset_id = dataset_id,
+            query_vector = query_vector,
         )
+        # 为什么要这样读写文件？？？
+        
         # ANN 检索
-        top10s_retrieved = read_result_ids(Path(os.environ.get("EVAL_RESULT_PATH"), "id100.u64bin"))
-        top10s_untrimmed = []
-        for top10 in tqdm(top10s_retrieved):
-            for item in top10:
-                top10s_untrimmed.append(item)
-        top10s = [top10s_untrimmed[i : i + 10] for i in range(0, len(top10s_untrimmed), 10)]
+        # top10s_untrimmed = []
+        # for top10 in tqdm(top10s_retrieved):
+        #     for item in top10:
+        #         top10s_untrimmed.append(item)
+        # top10s = [top10s_untrimmed[i : i + 10] for i in range(0, len(top10s_untrimmed), 10)]
         # 根据labels和ids计算hit_rate和ndcg
-        hit_rate = sum([labels[i] in top10s[i] for i in range(len(top10s))])/len(top10s)
+        hit_rate = sum([labels[i] in top10s_retrieved[i] for i in range(len(labels))])/len(labels)
         return hit_rate
     def get_candidate_emb(self):
         """
@@ -167,11 +167,11 @@ class Infer:
                 creative_ids.append(creative_id)
                 features.append(feature)
 
-        self.model.save_item_emb(item_ids, item_ids, features, os.environ.get('EVAL_RESULT_PATH'))
+        dataset_vector,dataset_id = self.model.save_item_emb(item_ids, item_ids, features, os.environ.get('EVAL_RESULT_PATH'))
         with open(Path(os.environ.get('EVAL_RESULT_PATH'), "retrive_id2creative_id.json"), "w") as f:
             json.dump(retrieve_id2creative_id, f)
         print(f"create_id un_hit {un_hit_cnt}/{total_cnt}")
-        return item_ids
+        return item_ids, dataset_vector,dataset_id
 
     def process_cold_start_feat(self, feat):
         """

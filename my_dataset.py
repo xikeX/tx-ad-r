@@ -31,7 +31,7 @@ class BaseDataset():
     def __init__(self, data_dir, args):
         self.data_dir = Path(data_dir)
 
-        self.data_file = open(self.data_dir / "seq.jsonl", 'rb')
+        self.data_file = None
         with open(Path(self.data_dir, 'seq_offsets.pkl'), 'rb') as f:
             self.seq_offsets = pickle.load(f)
 
@@ -109,7 +109,7 @@ class BaseDataset():
         return feat_default_value, feat_types, feat_statistics
 
     ## data process
-    def _load_user_data(self, uid):
+    def _load_user_data(self, uid, data_file):
         """
         从数据文件中加载单个用户的数据
 
@@ -119,8 +119,8 @@ class BaseDataset():
         Returns:
             data: 用户序列数据，格式为[(user_id, item_id, user_feat, item_feat, action_type, timestamp)]
         """
-        self.data_file.seek(self.seq_offsets[uid])
-        line = self.data_file.readline()
+        data_file.seek(self.seq_offsets[uid])
+        line = data_file.readline()
         data = json.loads(line)
         return data
     
@@ -271,10 +271,13 @@ class TrainDataset(torch.utils.data.Dataset):
         self.sample_index = sample_index # 采样索引
         self.max_padding_size = max_padding_size
         self.neg_sample_size = neg_sample_size
+        self.data_file = None
 
     def __getitem__(self, index):
+        if self.data_file is None:
+            self.data_file = open(self.base_dataset.data_dir / "seq.jsonl", 'rb')
         uid = self.sample_index[index]
-        user_sequence = self.base_dataset._load_user_data(uid)
+        user_sequence = self.base_dataset._load_user_data(uid,self.data_file)
 
         return self.build_example(user_sequence)
 
@@ -397,10 +400,13 @@ class ValidDataset(torch.utils.data.Dataset):
         self.base_dataset = base_dataset
         self.sample_index = sample_index # 采样索引
         self.max_padding_size = max_padding_size
+        self.data_file = None
 
     def __getitem__(self, index):
+        if self.data_file is None:
+            self.data_file = open(self.base_dataset.data_dir / "seq.jsonl", 'rb')
         uid = self.sample_index[index]
-        user_sequence = self.base_dataset._load_user_data(uid)
+        user_sequence = self.base_dataset._load_user_data(uid,self.data_file)
 
         return self.build_example(user_sequence)
     def __len__(self):
@@ -503,6 +509,7 @@ class EmbeddingDataset(torch.utils.data.IterableDataset):
         self.cache_index = 0
         self.max_cache_size = max_cache_size
         self.neg_sample_size = neg_sample_size
+        self.data_file = None
 
     def __iter__(self):
         while True:
@@ -536,7 +543,9 @@ class EmbeddingDataset(torch.utils.data.IterableDataset):
             explore_item_sequence = []
             uid = self.sample_index[self.original_data_index]
             self.original_data_index+=1
-            user_sequence = self.base_dataset._load_user_data(uid)
+            if self.data_file is None:
+                self.data_file = open(self.base_dataset.data_dir / "seq.jsonl", 'rb')
+            user_sequence = self.base_dataset._load_user_data(uid, self.data_file)
             ts = set()
             u=None
             for record_tuple in user_sequence:

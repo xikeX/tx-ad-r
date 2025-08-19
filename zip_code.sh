@@ -15,6 +15,7 @@ files_to_zip=(
     info_only.py
     model_rqvae.py
     split_embedding_model.py
+    baseline_model.py
 )
 
 # 执行压缩

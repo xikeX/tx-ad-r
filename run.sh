@@ -12,4 +12,4 @@ zip_file="myarchive.zip"
 unzip -o "$zip_file"
 
 # write your code below
-python -u main.py --use_lr_scheduler_in_downstream --verbose
+python -u main.py --use_lr_scheduler_in_downstream --verbose --norm_first --downstream_task_lr=0.01

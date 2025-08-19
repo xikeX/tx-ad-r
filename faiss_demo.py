@@ -69,10 +69,13 @@ def save_emb(emb, save_path):
 
 
 def run_faiss_ann_search(
-    dataset_vector_file_path: str,
-    dataset_id_file_path: str,
-    query_vector_file_path: str,
-    result_id_file_path: str,
+    dataset_vector_file_path: str=None,
+    dataset_id_file_path: str=None,
+    query_vector_file_path: str=None,
+    result_id_file_path=None,
+    dataset_vector=None,
+    dataset_id=None,
+    query_vector=None,
     query_ann_top_k: int = 10,
     faiss_M: int = 64,
     faiss_ef_construction: int = 1280,
@@ -93,19 +96,19 @@ def run_faiss_ann_search(
         query_ef_search (int): 查询时的探索深度
         faiss_metric_type (int): 距离度量类型 (0=L2, 1=内积)
     """
-    print("Loading dataset vectors...")
-    xb = read_fbin(dataset_vector_file_path)  # [N, D]
-    ids = read_fbin(dataset_id_file_path)   # [N]
+    if dataset_vector is None:
+        dataset_vector = read_fbin(dataset_vector_file_path)  # [N, D]
+    if dataset_id is None:
+        dataset_id = read_fbin(dataset_id_file_path)   # [N]
 
-    print("Loading query vectors...")
-    xq = read_fbin(query_vector_file_path)    # [Q, D]
+    if query_vector is None:
+        query_vector = read_fbin(query_vector_file_path)    # [Q, D]
 
-    assert len(ids) == len(xb), "Error: 向量数量和 ID 数量不匹配！"
+    assert len(dataset_id) == len(dataset_vector), "Error: 向量数量和 ID 数量不匹配！"
 
-    dim = xb.shape[1]
+    dim = dataset_vector.shape[1]
     metric = faiss.METRIC_L2 if faiss_metric_type == 0 else faiss.METRIC_INNER_PRODUCT
 
-    print("Building HNSW index...")
     index = faiss.IndexHNSWFlat(dim, faiss_M, metric)
     index.hnsw.efConstruction = faiss_ef_construction
     index.hnsw.efSearch = query_ef_search
@@ -113,18 +116,15 @@ def run_faiss_ann_search(
 
     # 包装成 IDMap 以保留原始 ID
     index = faiss.IndexIDMap2(index)  # 包装成 IDMap
-    ids = ids.ravel()
-    index.add_with_ids(xb, ids)
+    dataset_id = dataset_id.ravel()
+    index.add_with_ids(dataset_vector, dataset_id)
 
     # ✅ 正确方式：通过 .index 访问底层 HNSW 索引
     # index.index.hnsw.efSearch = query_ef_search
 
-    print("Searching for nearest neighbors...")
-    distances, indices = index.search(xq, query_ann_top_k)
+    distances, indices = index.search(query_vector, query_ann_top_k)
+    if result_id_file_path is not None:
+        print(f"Writing Top-{query_ann_top_k} results to {result_id_file_path}")
+        save_emb(indices.astype(np.uint64),result_id_file_path)
 
-    print(f"Writing Top-{query_ann_top_k} results to {result_id_file_path}")
-    save_emb(indices.astype(np.uint64),result_id_file_path)
-
-    # 输出平均距离
-    print(f"Average distance: {np.mean(distances)}")
-    print("ANN search completed.")
+    return indices

@@ -104,14 +104,15 @@ class BaselineModel(torch.nn.Module):
 
     def __init__(self, user_num, item_num, feat_statistics, feat_types, args):  #
         super(BaselineModel, self).__init__()
-
+        self.train_record = ['total_loss','pos_sim','neg_sim']
+        self.eval_record = ['total_loss','pos_sim','neg_sim']
         self.user_num = user_num
         self.item_num = item_num
         self.dev = args.device
         self.norm_first = args.norm_first
         self.maxlen = args.maxlen
         # TODO: loss += args.l2_emb for regularizing embedding vectors during training
-        # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch
+        # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch  
 
         self.item_emb = torch.nn.Embedding(self.item_num + 1, args.hidden_units, padding_idx=0)
         self.user_emb = torch.nn.Embedding(self.user_num + 1, args.hidden_units, padding_idx=0)
@@ -336,7 +337,8 @@ class BaselineModel(torch.nn.Module):
 
         for i in range(len(self.attention_layers)):
             if self.norm_first:
-                x = self.attention_layernorms[i](seqs)
+                x = seqs
+                x = self.attention_layernorms[i](x)
                 mha_outputs, _ = self.attention_layers[i](x, x, x, attn_mask=attention_mask)
                 seqs = seqs + mha_outputs
                 seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
@@ -379,18 +381,23 @@ class BaselineModel(torch.nn.Module):
         neg_logits = (log_feats * neg_embs).sum(dim=-1)
         pos_logits = pos_logits * loss_mask
         neg_logits = neg_logits * loss_mask
-        loss = self.loss(pos_logits, neg_logits, next_mask)
+        loss, pos_sim, neg_sim = self.loss(pos_logits, neg_logits, next_mask)
         return {
-            "loss":loss,
+            "total_loss":loss,
+            "pos_sim":pos_sim,
+            "neg_sim":neg_sim
         }
 
     def loss(self, pos_logits, neg_logits, next_token_type):
-        pos_labels, neg_labels = torch.ones(pos_logits.shape, device=args.device), torch.zeros(
+        pos_labels, neg_labels = torch.ones(pos_logits.shape, device=pos_logits.device), torch.zeros(
             neg_logits.shape, device=pos_logits.device
         )
-        indices = np.where(next_token_type == 1)
+        indices = torch.where(next_token_type == 1)
         loss = self.bce_criterion(pos_logits[indices], pos_labels[indices])
+        pos_sim = pos_logits[indices].mean()
         loss += self.bce_criterion(neg_logits[indices], neg_labels[indices])
+        neg_sim = neg_logits[indices].mean()
+        return loss, pos_sim, neg_sim
         
     def predict(self, log_seqs, seq_feature, mask):
         """
@@ -440,3 +447,4 @@ class BaselineModel(torch.nn.Module):
         final_embs = np.concatenate(all_embs, axis=0)
         save_emb(final_embs, Path(save_path, 'embedding.fbin'))
         save_emb(final_ids, Path(save_path, 'id.u64bin'))
+        return final_embs, final_ids
