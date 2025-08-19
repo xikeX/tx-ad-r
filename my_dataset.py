@@ -295,11 +295,11 @@ class TrainDataset(torch.utils.data.Dataset):
                 ext_user_sequence.append((i, item_feat, 1, action_type))
                 if action_type==0:
                     explore_unlick_sample_index.append(len(ext_user_sequence)-1)
-        if len(explore_unlick_sample_index)>2:
-            while random.random()<0.2:
-                a = random.choice(explore_unlick_sample_index)
-                b = random.choice(explore_unlick_sample_index)
-                ext_user_sequence[a], ext_user_sequence[b] = ext_user_sequence[b], ext_user_sequence[a]
+        # if len(explore_unlick_sample_index)>2:
+        #     while random.random()<0.2:
+        #         a = random.choice(explore_unlick_sample_index)
+        #         b = random.choice(explore_unlick_sample_index)
+        #         ext_user_sequence[a], ext_user_sequence[b] = ext_user_sequence[b], ext_user_sequence[a]
         if cur_u!=None: # 插入用户
             ext_user_sequence.insert(0, (cur_u, cur_user_feat, 2, cur_action_type))
         seq = np.zeros([self.max_padding_size + 1], dtype=np.int32) # 输入序列

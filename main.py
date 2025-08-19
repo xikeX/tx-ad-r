@@ -85,8 +85,8 @@ def get_args():
     parser.add_argument('--num_worker', type=int, default=5, help='序列最大长度')
 
     # ================== 模型结构参数 ==================
-    parser.add_argument('--hidden_units', type=int, default=64, help='隐藏层维度')
-    parser.add_argument('--num_blocks', type=int, default=4, help='Transformer 块数')
+    parser.add_argument('--hidden_units', type=int, default=32, help='隐藏层维度')
+    parser.add_argument('--num_blocks', type=int, default=1, help='Transformer 块数')
     parser.add_argument('--num_heads', type=int, default=4, help='多头注意力头数')
     parser.add_argument('--dropout_rate', type=float, default=0.1, help='Dropout 比例')
     parser.add_argument('--l2_emb', type=float, default=0.0, help='嵌入层 L2 正则强度')

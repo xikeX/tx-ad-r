@@ -12,6 +12,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args":[
+                // "--norm_first",
                 // "--use_lr_scheduler_in_downstream",
                 // "--use_embedding_model"
                 // "--checkpoint_path","/HOME/hitsz_mszhang/hitsz_mszhang_1/RL_ERC/tecent_recommondation/user_cache_file/global_step78_sim_model.valid_loss=3.1996",
