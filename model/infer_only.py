@@ -33,7 +33,7 @@ from tqdm import tqdm
 # 自定义模块
 from my_dataset import BaseDataset, TrainDataset, EmbeddingDataset, ValidDataset
 from embedding_model import BaselineModel as EmbeddingModel
-from model import BaselineModel as DownstreamModel
+ as DownstreamModel
 
 
 def set_seed(seed=42):

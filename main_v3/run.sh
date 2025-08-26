@@ -12,6 +12,6 @@ zip_file="myarchive.zip"
 unzip -o "$zip_file"
 
 # write your code below
-python -u main.py --train_name=v3 --use_lr_scheduler_in_downstream --verbose --norm_first --downstream_task_lr=0.01
+python -u main.py --train_name=v3 --use_lr_scheduler_in_downstream 
 
 python -u infer_main.py --train_name=v3

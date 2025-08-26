@@ -11,5 +11,3 @@ log_path/
 checkpoint/
 __pycache__/*
 temp/
-*.pkl
-*.json

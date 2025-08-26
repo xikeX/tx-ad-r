@@ -4,9 +4,86 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-
 from dataset import save_emb
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+def info_nce_loss(anchor, positive, negatives=None, temperature=0.1, use_inbatch_negatives=True):
+    """
+    InfoNCE Loss 支持：
+    - 显式负样本 (negatives)
+    - batch 内负样本 (可选)
+    
+    Args:
+        anchor: (N, D)
+        positive: (N, D)
+        negatives: (N, K, D) 或 None
+        temperature: float
+        use_inbatch_negatives: bool, 是否使用 batch 内其他样本作为负样本
+    
+    Returns:
+        loss: scalar
+    """
+    device = anchor.device
+    batch_size = anchor.size(0)
+
+    # L2 归一化
+    # anchor = F.normalize(anchor, dim=1)      # (N, D)
+    # positive = F.normalize(positive, dim=1)  # (N, D)
+
+    # ========== 构建 logits ==========
+    # 正样本相似度: (N, 1)
+    pos_sim = torch.sum(anchor * positive, dim=1, keepdim=True)  # (N, 1)
+
+    # 显式负样本相似度: (N, K)
+    neg_sim_list = []
+
+    if negatives is not None:
+        K = negatives.size(1)
+        # negatives = F.normalize(negatives, dim=2)  # (N, K, D)
+        explicit_neg_sim = torch.bmm(anchor.unsqueeze(1), negatives.transpose(1, 2))  # (N, 1, K)
+        explicit_neg_sim = explicit_neg_sim.squeeze(1)  # (N, K)
+        neg_sim_list.append(explicit_neg_sim)
+
+    # batch 内负样本: anchor 与所有 positive 的相似度，去掉对角线（自己）
+    if use_inbatch_negatives:
+        # 计算 anchor 与所有 positive 的相似度（包括自己）
+        inbatch_sim = torch.matmul(anchor, positive.T)  # (N, N)
+        # 创建 mask，去掉对角线（正样本）
+        mask = torch.eye(batch_size, dtype=torch.bool, device=device)
+        inbatch_neg_sim = inbatch_sim.masked_select(~mask).view(batch_size, -1)  # (N, N-1)
+        neg_sim_list.append(inbatch_neg_sim)
+
+    # 拼接所有负样本相似度
+    if neg_sim_list:
+        neg_sim = torch.cat(neg_sim_list, dim=1)  # (N, K + N - 1)
+    else:
+        raise ValueError("At least one type of negative samples must be provided.")
+
+    # 拼接正 + 负
+    logits = torch.cat([pos_sim, neg_sim], dim=1) / temperature  # (N, 1 + K + N - 1)
+
+    # 标签：正样本在第 0 位
+    labels = torch.zeros(batch_size, dtype=torch.long).to(device)
+
+    loss = F.cross_entropy(logits, labels)
+    return loss
+
+
+
+class RMSNorm(torch.nn.Module):
+    def __init__(self, hidden_size, eps=1e-8):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, x):
+        # 计算均方根
+        rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
+        x_normalized = x / rms
+        return x_normalized * self.weight  # 可学习的缩放参数
 
 class FlashMultiHeadAttention(torch.nn.Module):
     def __init__(self, hidden_units, num_heads, dropout_rate):
@@ -77,8 +154,6 @@ class PointWiseFeedForward(torch.nn.Module):
         outputs = self.dropout2(self.conv2(self.relu(self.dropout1(self.conv1(inputs.transpose(-1, -2))))))
         outputs = outputs.transpose(-1, -2)  # as Conv1D requires (N, C, Length)
         return outputs
-
-
 class BaselineModel(torch.nn.Module):
     """
     Args:
@@ -104,15 +179,14 @@ class BaselineModel(torch.nn.Module):
 
     def __init__(self, user_num, item_num, feat_statistics, feat_types, args):  #
         super(BaselineModel, self).__init__()
-        self.train_record = ['total_loss','pos_sim','neg_sim']
-        self.eval_record = ['total_loss','pos_sim','neg_sim']
+
         self.user_num = user_num
         self.item_num = item_num
         self.dev = args.device
         self.norm_first = args.norm_first
         self.maxlen = args.maxlen
         # TODO: loss += args.l2_emb for regularizing embedding vectors during training
-        # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch  
+        # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch
 
         self.item_emb = torch.nn.Embedding(self.item_num + 1, args.hidden_units, padding_idx=0)
         self.user_emb = torch.nn.Embedding(self.user_num + 1, args.hidden_units, padding_idx=0)
@@ -167,7 +241,7 @@ class BaselineModel(torch.nn.Module):
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_EMB_FEAT:
             self.emb_transform[k] = torch.nn.Linear(self.ITEM_EMB_FEAT[k], args.hidden_units)
-        self.bce_criterion = torch.nn.BCEWithLogitsLoss(reduction='mean')
+        self.sample_index = []
 
     def _init_feat_info(self, feat_statistics, feat_types):
         """
@@ -301,13 +375,15 @@ class BaselineModel(torch.nn.Module):
 
         # merge features
         all_item_emb = torch.cat(item_feat_list, dim=2)
-        all_item_emb = torch.relu(self.itemdnn(all_item_emb))
+        all_item_emb = torch.tanh(self.itemdnn(all_item_emb)) # (batch_size, item_num, hidden_units)
         if include_user:
             all_user_emb = torch.cat(user_feat_list, dim=2)
-            all_user_emb = torch.relu(self.userdnn(all_user_emb))
+            all_user_emb = torch.tanh(self.userdnn(all_user_emb))
             seqs_emb = all_item_emb + all_user_emb
         else:
             seqs_emb = all_item_emb
+        # 归一化
+        seqs_emb = F.normalize(seqs_emb, dim=-1)
         return seqs_emb
 
     def log2feats(self, log_seqs, mask, seq_feature):
@@ -337,8 +413,7 @@ class BaselineModel(torch.nn.Module):
 
         for i in range(len(self.attention_layers)):
             if self.norm_first:
-                x = seqs
-                x = self.attention_layernorms[i](x)
+                x = self.attention_layernorms[i](seqs)
                 mha_outputs, _ = self.attention_layers[i](x, x, x, attn_mask=attention_mask)
                 seqs = seqs + mha_outputs
                 seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
@@ -348,11 +423,12 @@ class BaselineModel(torch.nn.Module):
                 seqs = self.forward_layernorms[i](seqs + self.forward_layers[i](seqs))
 
         log_feats = self.last_layernorm(seqs)
+
         return log_feats
 
     def forward(
-        self, user_item, pos_seqs, neg_seqs, mask, next_mask, next_action_type, seq_feature, pos_feature, neg_feature
-    ):
+        self, user_item, input_item, pos1_item, neg1_item, user_feat, input_item_feat, pos1_item_feat, neg1_item_feat
+        ):
         """
         训练时调用，计算正负样本的logits
 
@@ -371,34 +447,25 @@ class BaselineModel(torch.nn.Module):
             pos_logits: 正样本logits，形状为 [batch_size, maxlen]
             neg_logits: 负样本logits，形状为 [batch_size, maxlen]
         """
-        log_feats = self.log2feats(user_item, mask, seq_feature)
-        loss_mask = (next_mask == 1).to(self.dev)
+        # 把样本拼起来
+        seqs = torch.stack([input_item.flatten(), pos1_item.flatten(), neg1_item.flatten()], dim=0)
+        # print(seqs.shape)
+        mask = torch.ones(seqs.shape[0], seqs.shape[1])
+        feature = [input_item_feat, pos1_item_feat, neg1_item_feat]
+        # 计算特征
+        all_embs = self.feat2emb(seqs, feature, mask, include_user=False)
+        # 计算embedding的余弦相似度
+        input_embeds = all_embs[0:1, :, :]  # (1, batch_size, H)
+        pos_embeds = all_embs[1:2, :, :]    # (1, batch_size, H)
+        neg1_embeds = all_embs[2:3, :, :]   # (1, batch_size, H)
 
-        pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
-        neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
+        input_embeds = input_embeds.squeeze(0)  # (batch_size, H)
+        pos_embeds = pos_embeds.squeeze(0)      # (batch_size, H)
+        neg1_embeds = neg1_embeds.squeeze(0).unsqueeze(1) # (batch_size, H)
+        # 计算input_embeds和pos_embeds的余弦距离
+        loss = info_nce_loss(input_embeds, pos_embeds, neg1_embeds)
+        return loss
 
-        pos_logits = (log_feats * pos_embs).sum(dim=-1)
-        neg_logits = (log_feats * neg_embs).sum(dim=-1)
-        pos_logits = pos_logits * loss_mask
-        neg_logits = neg_logits * loss_mask
-        loss, pos_sim, neg_sim = self.loss(pos_logits, neg_logits, next_mask)
-        return {
-            "total_loss":loss,
-            "pos_sim":pos_sim,
-            "neg_sim":neg_sim
-        }
-
-    def loss(self, pos_logits, neg_logits, next_token_type):
-        pos_labels, neg_labels = torch.ones(pos_logits.shape, device=pos_logits.device), torch.zeros(
-            neg_logits.shape, device=pos_logits.device
-        )
-        indices = torch.where(next_token_type == 1)
-        loss = self.bce_criterion(pos_logits[indices], pos_labels[indices])
-        pos_sim = pos_logits[indices].mean()
-        loss += self.bce_criterion(neg_logits[indices], neg_labels[indices])
-        neg_sim = neg_logits[indices].mean()
-        return loss, pos_sim, neg_sim
-        
     def predict(self, log_seqs, seq_feature, mask):
         """
         计算用户序列的表征
@@ -447,4 +514,3 @@ class BaselineModel(torch.nn.Module):
         final_embs = np.concatenate(all_embs, axis=0)
         save_emb(final_embs, Path(save_path, 'embedding.fbin'))
         save_emb(final_ids, Path(save_path, 'id.u64bin'))
-        return final_embs, final_ids

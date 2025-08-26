@@ -1,3 +1,30 @@
+# main.py
+from collections import defaultdict
+from datetime import datetime
+import os
+import pickle
+
+from infer import Infer
+if os.environ.get("DEBUG_MODE","") == 'True':
+    print("in debug model")
+    os.environ['TRAIN_LOG_PATH']='./log_path'
+    os.environ['TRAIN_TF_EVENTS_PATH']='./log_path'
+    os.environ['TRAIN_DATA_PATH']='../TencentGR_1k'
+    os.environ['TRAIN_CKPT_PATH']='./checkpoint'
+    os.environ['USER_CACHE_PATH']='../user_cache_file'
+    os.environ['DEBUG_MODE'] = 'True'
+    # 设置单GPU
+import os
+from transformers import get_cosine_schedule_with_warmup
+# 获取当前目录（'.'）的绝对路径
+current_abs_path = os.path.abspath('./temp')
+os.environ['TEMP_PATH'] = current_abs_path
+os.makedirs(os.environ['TEMP_PATH'], exist_ok = True)
+current_abs_path = os.path.abspath('./eval_result')
+os.environ['EVAL_RESULT_PATH'] = current_abs_path
+os.makedirs(os.environ['EVAL_RESULT_PATH'], exist_ok = True)
+
+
 import argparse
 import json
 import os
@@ -29,7 +56,7 @@ def get_args():
     parser.add_argument('--num_heads', default=1, type=int)
     parser.add_argument('--dropout_rate', default=0.2, type=float)
     parser.add_argument('--l2_emb', default=0.0, type=float)
-    parser.add_argument('--device', default='cuda', type=str)
+    parser.add_argument('--device', default=None, type=str)
     parser.add_argument('--inference_only', action='store_true')
     parser.add_argument('--state_dict_path', default=None, type=str)
     parser.add_argument('--norm_first', action='store_true')
@@ -38,6 +65,7 @@ def get_args():
     parser.add_argument('--mm_emb_id', nargs='+', default=['81'], type=str, choices=[str(s) for s in range(81, 87)])
 
     args = parser.parse_args()
+    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     return args
 
@@ -51,16 +79,23 @@ if __name__ == '__main__':
     data_path = os.environ.get('TRAIN_DATA_PATH')
 
     args = get_args()
-    dataset = MyDataset(data_path, args)
-    train_dataset, valid_dataset = torch.utils.data.random_split(dataset, [0.9, 0.1])
+    train_dataset = MyDataset(data_path, args)
+    valid_dataset = MyDataset(data_path, args)
+
+    with open(os.environ.get("USER_CACHE_PATH")+"/train_idx.pkl", "rb") as f:
+        train_idx = pickle.load(f)
+    with open(os.environ.get("USER_CACHE_PATH")+"/valid_idx.pkl", "rb") as f:
+        valid_idx = pickle.load(f)
+    train_dataset.sample_index = train_idx
+    valid_dataset.sample_index = valid_idx
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=dataset.collate_fn
+        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, collate_fn=train_dataset.collate_fn
     )
     valid_loader = DataLoader(
-        valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=dataset.collate_fn
+        valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0, collate_fn=valid_dataset.collate_fn
     )
-    usernum, itemnum = dataset.usernum, dataset.itemnum
-    feat_statistics, feat_types = dataset.feat_statistics, dataset.feature_types
+    usernum, itemnum = train_dataset.usernum, train_dataset.itemnum
+    feat_statistics, feat_types = train_dataset.feat_statistics, train_dataset.feature_types
 
     model = BaselineModel(usernum, itemnum, feat_statistics, feat_types, args).to(args.device)
 
@@ -158,7 +193,12 @@ if __name__ == '__main__':
         save_dir = Path(os.environ.get('TRAIN_CKPT_PATH'), f"global_step{global_step}.valid_loss={valid_loss_sum:.4f}")
         save_dir.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), save_dir / "model.pt")
+        save_dir = Path(os.environ.get('USER_CACHE_PATH'), f"global_step_{epoch}")
+        save_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), save_dir / "model.pt")
 
     print("Done")
     writer.close()
     log_file.close()
+
+# main.py

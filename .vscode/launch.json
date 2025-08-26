@@ -11,9 +11,13 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal",
+            "cwd":"${fileDirname}",
             "args":[
                 // "--norm_first",
                 // "--use_lr_scheduler_in_downstream",
+                // "--train_data_size","400",
+                // "--dropout_rate","0.0",
+                // "--num_worker","8",
                 // "--use_embedding_model"
                 // "--checkpoint_path","/HOME/hitsz_mszhang/hitsz_mszhang_1/RL_ERC/tecent_recommondation/user_cache_file/global_step78_sim_model.valid_loss=3.1996",
             ],

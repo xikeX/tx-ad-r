@@ -4,9 +4,102 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-
 from dataset import save_emb
 
+import torch
+import torch.nn.functional as F
+
+def info_nce_loss(anchor, positive, negatives=None,weight=None, temperature=0.1, use_inbatch_negatives=True):
+    """
+    InfoNCE Loss 支持：
+    - 显式负样本 (negatives)
+    - batch 内负样本 (可选)
+    
+    Args:
+        anchor: (N, D)
+        positive: (N, D)
+        negatives: (N, K, D) 或 None
+        temperature: float
+        use_inbatch_negatives: bool, 是否使用 batch 内其他样本作为负样本
+    
+    Returns:
+        loss: scalar
+    """
+    device = anchor.device
+    batch_size = anchor.size(0)
+
+    # L2 归一化
+    # anchor = F.normalize(anchor, dim=1)      # (N, D)
+    # positive = F.normalize(positive, dim=1)  # (N, D)
+
+    # ========== 构建 logits ==========
+    # 正样本相似度: (N, 1)
+    pos_sim = torch.sum(anchor * positive, dim=1, keepdim=True)  # (N, 1)
+
+    # 显式负样本相似度: (N, K)
+    neg_sim_list = []
+
+    if negatives is not None:
+        K = negatives.size(1)
+        # negatives = F.normalize(negatives, dim=2)  # (N, K, D)
+        explicit_neg_sim = torch.bmm(anchor.unsqueeze(1), negatives.transpose(1, 2))  # (N, 1, K)
+        explicit_neg_sim = explicit_neg_sim.squeeze(1)  # (N, K)
+        neg_sim_list.append(explicit_neg_sim)
+
+    # batch 内负样本: anchor 与所有 positive 的相似度，去掉对角线（自己）
+    # if use_inbatch_negatives:
+    #     # 计算 anchor 与所有 positive 的相似度（包括自己）
+    #     inbatch_sim = torch.matmul(anchor, positive.T)  # (N, N)
+    #     # 创建 mask，去掉对角线（正样本）
+    #     mask = torch.eye(batch_size, dtype=torch.bool, device=device)
+    #     inbatch_neg_sim = inbatch_sim.masked_select(~mask).view(batch_size, -1)  # (N, N-1)
+    #     neg_sim_list.append(inbatch_neg_sim)
+
+    # 拼接所有负样本相似度
+    if neg_sim_list:
+        neg_sim = torch.cat(neg_sim_list, dim=1)  # (N, K + N - 1)
+    else:
+        raise ValueError("At least one type of negative samples must be provided.")
+
+    # 拼接正 + 负
+    logits = torch.cat([pos_sim, neg_sim], dim=1) / temperature  # (N, 1 + K + N - 1)
+
+    # 标签：正样本在第 0 位
+    labels = torch.zeros(batch_size, dtype=torch.long).to(device)
+
+    loss = F.cross_entropy(logits, labels, reduction='none')
+    if weight is not None:
+        loss = loss*weight
+    return loss.mean(), pos_sim.mean(), neg_sim.mean()
+
+def cosine_similarity_loss(a, b):
+    """
+    计算两个张量 a 和 b 在 hidden 维度上的余弦相似度损失
+    :param a: shape [batch, sample, hidden]
+    :param b: shape [batch, sample, hidden]
+    :return: loss, shape [batch, sample]
+    """
+    # 计算余弦相似度
+    # F.cosine_similarity 默认在最后一个维度上计算
+    cos_sim = F.cosine_similarity(a, b, dim=-1)  # shape: [batch, sample]
+    
+    # 计算损失：1 - 余弦相似度
+    # 这样当余弦相似度为 1 时，损失为 0；当余弦相似度为 -1 时，损失为 2
+    loss = 1 - cos_sim
+    
+    return loss
+
+class RMSNorm(torch.nn.Module):
+    def __init__(self, hidden_size, eps=1e-8):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, x):
+        # 计算均方根
+        rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
+        x_normalized = x / rms
+        return x_normalized * self.weight  # 可学习的缩放参数
 
 class FlashMultiHeadAttention(torch.nn.Module):
     def __init__(self, hidden_units, num_heads, dropout_rate):
@@ -111,7 +204,7 @@ class BaselineModel(torch.nn.Module):
         self.norm_first = args.norm_first
         self.maxlen = args.maxlen
         # TODO: loss += args.l2_emb for regularizing embedding vectors during training
-        # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch  
+        # https://stackoverflow.com/questions/42704283/adding-l1-l2-regularization-in-pytorch
 
         self.item_emb = torch.nn.Embedding(self.item_num + 1, args.hidden_units, padding_idx=0)
         self.user_emb = torch.nn.Embedding(self.user_num + 1, args.hidden_units, padding_idx=0)
@@ -166,6 +259,8 @@ class BaselineModel(torch.nn.Module):
             self.sparse_emb[k] = torch.nn.Embedding(self.USER_ARRAY_FEAT[k] + 1, args.hidden_units, padding_idx=0)
         for k in self.ITEM_EMB_FEAT:
             self.emb_transform[k] = torch.nn.Linear(self.ITEM_EMB_FEAT[k], args.hidden_units)
+        self.sample_index = []
+    
 
     def _init_feat_info(self, feat_statistics, feat_types):
         """
@@ -306,6 +401,7 @@ class BaselineModel(torch.nn.Module):
             seqs_emb = all_item_emb + all_user_emb
         else:
             seqs_emb = all_item_emb
+        seqs_emb = F.normalize(seqs_emb,dim=-1)
         return seqs_emb
 
     def log2feats(self, log_seqs, mask, seq_feature):
@@ -322,8 +418,18 @@ class BaselineModel(torch.nn.Module):
         maxlen = log_seqs.shape[1]
         seqs = self.feat2emb(log_seqs, seq_feature, mask=mask, include_user=True)
         seqs *= self.item_emb.embedding_dim**0.5
-        poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
-        poss *= log_seqs != 0
+        # 位置偏移有问题，需要从有值的位置开始
+        # 创建基础位置矩阵：[[1,2,3,4,5], [1,2,3,4,5], ...]
+        batch_size = log_seqs.shape[0]
+
+        # --- Left Padding 位置编码 ---
+        valid_mask = (log_seqs != 0)  # [batch_size, maxlen]
+        # 从左到右编号：第一个有效位置是1，第二个是2，...
+        poss = valid_mask.cumsum(dim=1)  # 自动实现“从左边开始编号”
+        poss = poss * valid_mask  # 确保0的位置仍是0（虽然cumsum已经是0）
+        poss = poss.long()
+        # poss = torch.arange(1, maxlen + 1, device=self.dev).unsqueeze(0).expand(batch_size, -1).clone()
+        # poss *= log_seqs != 0
         seqs += self.pos_emb(poss)
         seqs = self.emb_dropout(seqs)
 
@@ -374,13 +480,31 @@ class BaselineModel(torch.nn.Module):
 
         pos_embs = self.feat2emb(pos_seqs, pos_feature, include_user=False)
         neg_embs = self.feat2emb(neg_seqs, neg_feature, include_user=False)
-
+        
+        # 拉进相似物品之间的距离
+        # 连续物品被认为是相似物品
+        # a = pos_embs[:,:-1]
+        # b = pos_embs[:,1:]
+        # 计算余弦作为损失
+        # similar_loss = cosine_similarity_loss(a,b)
+        # 因为是leftpadding 所以可以
+        # similar_loss = similar_loss * loss_mask[:,:-1]
+        batch_size = pos_seqs.shape[0]
+        max_len = pos_seqs.shape[1]
+        neg_embs_number = neg_embs.shape[1]//max_len
+        neg_embs = neg_embs.unsqueeze(1).reshape(batch_size,neg_embs_number,max_len,-1)
         pos_logits = (log_feats * pos_embs).sum(dim=-1)
-        neg_logits = (log_feats * neg_embs).sum(dim=-1)
+        neg_logits = (log_feats.unsqueeze(1) * neg_embs).sum(dim=-1) 
         pos_logits = pos_logits * loss_mask
-        neg_logits = neg_logits * loss_mask
-
-        return pos_logits, neg_logits
+        neg_logits = neg_logits * loss_mask.unsqueeze(1)
+        log_feats = log_feats[loss_mask]
+        pos_embs = pos_embs[loss_mask]
+        neg_embs = neg_embs[loss_mask.unsqueeze(1).expand(-1, neg_embs_number, -1)].reshape(pos_embs.shape[0],-1,pos_embs.shape[-1])
+        weight = (next_action_type[loss_mask]+1)*0.5
+        infonce_loss,pos_sim,neg_sim = info_nce_loss(log_feats,pos_embs,neg_embs,weight)
+        
+        
+        return pos_logits, neg_logits, infonce_loss,pos_sim,neg_sim
 
     def predict(self, log_seqs, seq_feature, mask):
         """
@@ -430,5 +554,3 @@ class BaselineModel(torch.nn.Module):
         final_embs = np.concatenate(all_embs, axis=0)
         save_emb(final_embs, Path(save_path, 'embedding.fbin'))
         save_emb(final_ids, Path(save_path, 'id.u64bin'))
-        return final_embs, final_ids
-# model.py

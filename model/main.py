@@ -182,111 +182,111 @@ def train_downstream_model(model, train_loader, valid_loader, args, writer, test
 
     model.special_embedding_apply()
     for epoch in range(1, args.num_epochs + 1):
-        model.train()
-        t0 = time.time()
-        total_loss_epoch = 0.0
+        # model.train()
+        # t0 = time.time()
+        # total_loss_epoch = 0.0
 
-        start_time = round(time.time())
-        print("start time",start_time)
-        for step, batch in enumerate(train_loader):
-            # 解包数据
-            seq, pos, neg, token_type, next_token_type, next_action_type, \
-            seq_feat, pos_feat, neg_feat = batch
-            # 移动到设备
-            seq = seq.to(args.device)
-            pos = pos.to(args.device)
-            neg = neg.to(args.device)
-            token_type = token_type.to(args.device)
-            next_token_type = next_token_type.to(args.device)
-            next_action_type = next_action_type.to(args.device)
+        # start_time = round(time.time())
+        # print("start time",start_time)
+        # for step, batch in enumerate(train_loader):
+        #     # 解包数据
+        #     seq, pos, neg, token_type, next_token_type, next_action_type, \
+        #     seq_feat, pos_feat, neg_feat = batch
+        #     # 移动到设备
+        #     seq = seq.to(args.device)
+        #     pos = pos.to(args.device)
+        #     neg = neg.to(args.device)
+        #     token_type = token_type.to(args.device)
+        #     next_token_type = next_token_type.to(args.device)
+        #     next_action_type = next_action_type.to(args.device)
 
-            # 前向传播
-            output = model(
-                seq, pos, neg, token_type, next_token_type, next_action_type,
-                seq_feat, pos_feat, neg_feat
-            )
-            total_loss = output['total_loss'] 
+        #     # 前向传播
+        #     output = model(
+        #         seq, pos, neg, token_type, next_token_type, next_action_type,
+        #         seq_feat, pos_feat, neg_feat
+        #     )
+        #     total_loss = output['total_loss'] 
 
-            # L2 正则化（仅 item_emb）
-            if args.l2_emb > 0:
-                l2_reg = 0.0
-                for param in model.item_emb.parameters():
-                    l2_reg += torch.norm(param)
-                total_loss += args.l2_emb * l2_reg
+        #     # L2 正则化（仅 item_emb）
+        #     if args.l2_emb > 0:
+        #         l2_reg = 0.0
+        #         for param in model.item_emb.parameters():
+        #             l2_reg += torch.norm(param)
+        #         total_loss += args.l2_emb * l2_reg
 
-            # ✅ 检查损失是否为 NaN 或 Inf
-            if torch.isnan(total_loss) or torch.isinf(total_loss):
-                print(f"❌ 跳过 batch，损失异常（NaN/Inf） at epoch {epoch}, step {step}")
-                continue
+        #     # ✅ 检查损失是否为 NaN 或 Inf
+        #     if torch.isnan(total_loss) or torch.isinf(total_loss):
+        #         print(f"❌ 跳过 batch，损失异常（NaN/Inf） at epoch {epoch}, step {step}")
+        #         continue
 
-            # 反向传播
-            optimizer.zero_grad()
-            total_loss.backward()
+        #     # 反向传播
+        #     optimizer.zero_grad()
+        #     total_loss.backward()
 
-            # ✅ 梯度裁剪（防止梯度爆炸）
-            # if epoch>30:
-            #     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        #     # ✅ 梯度裁剪（防止梯度爆炸）
+        #     # if epoch>30:
+        #     #     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
-            # 输出所有层的梯度到writer
-            # for name, param in model.named_parameters():
-            #     if param.requires_grad and param.grad is not None:
-            #         writer.add_scalar(name + '_grad', param.grad.norm(), global_step)
-            optimizer.step()
-            if scheduler:
-                scheduler.step()
+        #     # 输出所有层的梯度到writer
+        #     # for name, param in model.named_parameters():
+        #     #     if param.requires_grad and param.grad is not None:
+        #     #         writer.add_scalar(name + '_grad', param.grad.norm(), global_step)
+        #     optimizer.step()
+        #     if scheduler:
+        #         scheduler.step()
 
-            if global_step%100==0 or os.environ.get('DEBUG_MODE', "")=="True":
+        #     if global_step%100==0 or os.environ.get('DEBUG_MODE', "")=="True":
 
-                writer.add_scalar('Learning Rate', optimizer.param_groups[0]['lr'], global_step)
-                if hasattr(model,'train_record'):
-                    for record_key in model.train_record:
-                        writer.add_scalar(f'Train/{record_key}', output[record_key], global_step)
-            if global_step%100==0 and step!=0:
-                end_time = round(time.time())
-                use_time = format_time(end_time - start_time)
-                remain_time = format_time((end_time - start_time)/step * len(train_loader))
-                msg = f"[{use_time}/{remain_time}]"
-                msg += f"[{step}/{len(train_loader)}]"
-                msg += f"global_step:{global_step} "
-                msg += f"epoch{epoch} "
-                msg += f"total_loss:{total_loss.item():.5f} "
-                msg += f"lr:{optimizer.param_groups[0]['lr']:0.5f}"
-                if hasattr(model,'train_record'):
-                    for record_key in model.train_record:
-                        msg += f" {record_key}:{output[record_key]:0.5f}"
-                print(msg + '\n')
-            total_loss_epoch += total_loss.item()
-            global_step += 1
+        #         writer.add_scalar('Learning Rate', optimizer.param_groups[0]['lr'], global_step)
+        #         if hasattr(model,'train_record'):
+        #             for record_key in model.train_record:
+        #                 writer.add_scalar(f'Train/{record_key}', output[record_key], global_step)
+        #     if global_step%100==0 and step!=0:
+        #         end_time = round(time.time())
+        #         use_time = format_time(end_time - start_time)
+        #         remain_time = format_time((end_time - start_time)/step * len(train_loader))
+        #         msg = f"[{use_time}/{remain_time}]"
+        #         msg += f"[{step}/{len(train_loader)}]"
+        #         msg += f"global_step:{global_step} "
+        #         msg += f"epoch{epoch} "
+        #         msg += f"total_loss:{total_loss.item():.5f} "
+        #         msg += f"lr:{optimizer.param_groups[0]['lr']:0.5f}"
+        #         if hasattr(model,'train_record'):
+        #             for record_key in model.train_record:
+        #                 msg += f" {record_key}:{output[record_key]:0.5f}"
+        #         print(msg + '\n')
+        #     total_loss_epoch += total_loss.item()
+        #     global_step += 1
 
-        avg_train_loss = total_loss_epoch / len(train_loader)
-        print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Time: {time.time() - t0:.2f}s")
+        # avg_train_loss = total_loss_epoch / len(train_loader)
+        # print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Time: {time.time() - t0:.2f}s")
 
-        # ========== 验证阶段 ==========
-        model.eval()
-        record = defaultdict(float)
-        val_batches = 0
-        with torch.no_grad():
-            for batch in tqdm(valid_loader, desc="Validation", leave=False):
-                seq, pos, neg, token_type, next_token_type, next_action_type, \
-                seq_feat, pos_feat, neg_feat = batch
+        # # ========== 验证阶段 ==========
+        # model.eval()
+        # record = defaultdict(float)
+        # val_batches = 0
+        # with torch.no_grad():
+        #     for batch in tqdm(valid_loader, desc="Validation", leave=False):
+        #         seq, pos, neg, token_type, next_token_type, next_action_type, \
+        #         seq_feat, pos_feat, neg_feat = batch
 
-                seq, pos, neg, next_token_type, next_action_type = \
-                    seq.to(args.device), pos.to(args.device), neg.to(args.device), next_token_type.to(args.device), next_action_type.to(args.device)
+        #         seq, pos, neg, next_token_type, next_action_type = \
+        #             seq.to(args.device), pos.to(args.device), neg.to(args.device), next_token_type.to(args.device), next_action_type.to(args.device)
                 
-                output = model(
-                    seq, pos, neg, token_type, next_token_type, next_action_type,
-                    seq_feat, pos_feat, neg_feat
-                )
-                total_loss = output['total_loss']
-                record['total_loss'] = total_loss.item()
-                if hasattr(model,'eval_record'):
-                    for record_key in model.eval_record:
-                        record[record_key] += output[record_key]
-                val_batches += 1
+        #         output = model(
+        #             seq, pos, neg, token_type, next_token_type, next_action_type,
+        #             seq_feat, pos_feat, neg_feat
+        #         )
+        #         total_loss = output['total_loss']
+        #         record['total_loss'] = total_loss.item()
+        #         if hasattr(model,'eval_record'):
+        #             for record_key in model.eval_record:
+        #                 record[record_key] += output[record_key]
+        #         val_batches += 1
 
-        for key in record:
-            record[key] /= val_batches
-            writer.add_scalar(f'Eval_Loss/{key}', record[key], global_step)
+        # for key in record:
+        #     record[key] /= val_batches
+        #     writer.add_scalar(f'Eval_Loss/{key}', record[key], global_step)
 
         # # ✅ 保存最佳模型
 

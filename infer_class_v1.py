@@ -1,4 +1,4 @@
-# infer_class.py
+# infer_class_v1.py
 import argparse
 import os
 # os.environ['TRAIN_LOG_PATH'] = './log'
@@ -22,6 +22,7 @@ from dataset import MyDataset, MyTestDataset, save_emb
 from faiss_demo import run_faiss_ann_search
 from torch.utils.tensorboard import SummaryWriter
 
+import pickle
 # from train_embedding_dataset import TrainEmbeddingDataset
 # 本地infer算法
 def final_score(hit_rate,ndcg):
@@ -46,7 +47,7 @@ def read_result_ids(file_path):
 
 
 class Infer:
-    def __init__(self,args, model, eval_dataset, candidate_path):
+    def __init__(self,args, model, eval_dataset, candidate_path,name,query_ann_top_k=10):
         self.model:torch.nn.Module = model
         self.eval_dataset:MyTestDataset = eval_dataset
         self.eval_dataloader = DataLoader(
@@ -64,21 +65,27 @@ class Infer:
         # 再eval_dataset 中带有label_item,同时label也应该在condidate中
         self.candidate_path = candidate_path
         self.device = args.device
+        self.name = name
+        self.query_ann_top_k = query_ann_top_k
 
     def infer(self):
         self.model.eval()
         all_embs = []
-        user_list = []
+        # user_list = []
         labels = []
         # 预测下一个query的embeding
         for step, batch in tqdm(enumerate(self.eval_dataloader), total=self.total_batch):
-            seq, token_type, seq_feat, user_id, label = batch
-            seq = seq.to(self.device)
-            logits = self.model.predict(seq, seq_feat, token_type)
+            token_type, seq_feat, user_feat, label = \
+                batch['token_type'], batch['seq_feat'], batch['user_feat'], batch['label']
+            for m in [seq_feat, seq_feat, user_feat, user_feat]:
+                    for k in m:
+                        m[k] = m[k].to(self.device)
+            token_type = token_type.to(self.device)
+            logits = self.model.predict(seq_feat, user_feat, token_type)
             for i in range(logits.shape[0]):
                 emb = logits[i].unsqueeze(0).detach().cpu().numpy().astype(np.float32)
                 all_embs.append(emb)
-            user_list.extend(user_id)
+            # user_list.extend(user_id)
             labels.extend([i[0] for i in label])
         query_vector = np.concatenate(all_embs, axis=0)
         save_emb(query_vector, Path(os.environ.get('EVAL_RESULT_PATH'), 'query.fbin'))
@@ -101,6 +108,7 @@ class Infer:
             dataset_vector = dataset_vector,
             dataset_id = dataset_id,
             query_vector = query_vector,
+            query_ann_top_k = self.query_ann_top_k
         )
         # 为什么要这样读写文件？？？
         
@@ -135,42 +143,51 @@ class Infer:
         candidate_path = Path(self.candidate_path)
         item_ids, creative_ids, retrieval_ids, features = [], [], [], []
         retrieve_id2creative_id = {}
-        total_cnt,un_hit_cnt = 0,0
-        with open(candidate_path, 'r') as f:
-            condidate_map = json.load(f)
-            for item_id in condidate_map:
-                total_cnt += 1
-                item_id = int(item_id)
-                # 读取item特征，并补充缺失值
-                feature = condidate_map[str(item_id)]
-                if os.environ.get("DEBUG_MODE","")=="True":
-                    if item_id in self.eval_dataset.base_dataset.indexer_i_rev:
-                        creative_id = self.eval_dataset.base_dataset.indexer_i_rev[item_id] 
+        temp_file = os.environ.get("TEMP_PATH", "./temp")
+        data_file = Path(temp_file, f"infer_data_{self.name}.pkl")
+        if  os.path.exists(data_file):
+            print(f"Load infer data from {data_file}")
+            with open(data_file, "rb") as f:
+                item_ids, creative_ids, retrieval_ids, features = pickle.load(f)
+        else:
+            # 感觉可以开多线程处理
+            with open(candidate_path, 'r') as f:
+                condidate_map = json.load(f)
+                for item_id in condidate_map:
+                    item_id = int(item_id)
+                    # 读取item特征，并补充缺失值
+                    feature = condidate_map[str(item_id)]
+                    if os.environ.get("DEBUG_MODE","")=="True":
+                        if item_id in self.eval_dataset.base_dataset.indexer_i_rev:
+                            creative_id = self.eval_dataset.base_dataset.indexer_i_rev[item_id] 
+                        else: 
+                            creative_id = 0
                     else:
-                        creative_id = 0
-                        un_hit_cnt +=1
-                else:
-                    creative_id = self.eval_dataset.base_dataset.indexer_i_rev[item_id] 
-                missing_fields = set(
-                    feat_types['item_sparse'] + feat_types['item_array'] + feat_types['item_continual']
-                ) - set(feature.keys())
-                feature = self.process_cold_start_feat(feature)
-                for feat_id in missing_fields:
-                    feature[feat_id] = feat_default_value[feat_id]
-                for feat_id in feat_types['item_emb']:
-                    if creative_id in mm_emb_dict[feat_id]:
-                        feature[feat_id] = mm_emb_dict[feat_id][creative_id]
-                    else:
-
-                        feature[feat_id] = np.zeros(EMB_SHAPE_DICT[feat_id], dtype=np.float32)
-                item_ids.append(item_id)
-                creative_ids.append(creative_id)
-                features.append(feature)
+                        creative_id = self.eval_dataset.base_dataset.indexer_i_rev[item_id]
+                    # 1，冷启动特征，相当于噪声，仅使用训练的特征
+                    # 2. 补充缺失值，在fill_missing_feat 中已经可以处理了。
+                    missing_fields = set(
+                        feat_types['item_sparse'] + feat_types['item_array'] + feat_types['item_continual']
+                    ) - set(feature.keys())
+                    feature = self.process_cold_start_feat(feature)
+                    for feat_id in missing_fields:
+                        feature[feat_id] = feat_default_value[feat_id]
+                    for feat_id in feat_types['item_emb']:
+                        if creative_id in mm_emb_dict[feat_id]:
+                            feature[feat_id] = mm_emb_dict[feat_id][creative_id]
+                        else:
+                            feature[feat_id] = np.zeros(EMB_SHAPE_DICT[feat_id], dtype=np.float32)
+                    item_ids.append(item_id)
+                    creative_ids.append(creative_id)
+                    features.append(self.eval_dataset.base_dataset.fill_missing_feat(feature, item_id, False))
+                # pickle.dump(creative_ids, open("data_v1.pkl",'wb'))
+            with open(data_file, "wb") as f:  # ← 注意是 "wb"，不是 "w"
+                pickle.dump([item_ids, creative_ids, retrieval_ids, features], f)
+        # 写到临时文件中等下一次直接读取
 
         dataset_vector,dataset_id = self.model.save_item_emb(item_ids, item_ids, features, os.environ.get('EVAL_RESULT_PATH'))
         with open(Path(os.environ.get('EVAL_RESULT_PATH'), "retrive_id2creative_id.json"), "w") as f:
             json.dump(retrieve_id2creative_id, f)
-        print(f"create_id un_hit {un_hit_cnt}/{total_cnt}")
         return item_ids, dataset_vector,dataset_id
 
     def process_cold_start_feat(self, feat):
@@ -270,7 +287,7 @@ def main():
     best_test_ndcg, best_test_hr = 0.0, 0.0
     t0 = time.time()
     print("Start training")
-    infer = Infer(args,model,eval_dataset=valid_dataset.dataset,candidate_path=os.path.join(os.environ.get('USER_CACHE_PATH'),'item_feat_dict_eval.json'))
+    infer = Infer(args,model,eval_dataset=valid_dataset.dataset,candidate_path=os.path.join(os.environ.get('TRAIN_DATA_PATH'),'item_feat_dict.json'))
     infer.infer()
 
 

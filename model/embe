@@ -1,0 +1,289 @@
+def train_embedding_model(embedding_model:EmbeddingModel, train_loader, valid_loader, optimizer, args, writer, log_file, global_step,verbose = False):
+    """训练嵌入模型主循环"""
+    print("开始训练嵌入模型...")
+    bce_criterion = nn.BCEWithLogitsLoss(reduction='mean')
+    best_val_loss = float('inf')
+    # 设置策略warmup 和 cosine decay策略
+    scheduler=None
+    if args.use_lr_scheduler_in_embedding_task:
+        scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(args.warm_up_rate * len(train_loader)),
+                                                num_training_steps=args.num_epochs * len(train_loader))
+    for epoch in range(1, args.num_epochs + 1):
+        embedding_model.train()
+        if args.inference_only:
+            print("inference_only 模式开启，跳过训练。")
+            break
+
+        t0 = time.time()
+        total_loss_epoch = 0.0
+
+        # 启用梯度缩放（用于混合精度或防止溢出）
+        scaler = torch.cuda.amp.GradScaler() if args.device == 'cuda' else None
+        local_step = 0
+        with tqdm(train_loader,total=-1, desc=f"Epoch {epoch}", leave=False) as pbar:
+            for step, batch in enumerate(pbar):
+                try:
+                    # 解包数据
+                    user, input_item, pos_item, neg_item, \
+                    user_feat, input_item_feat, pos_item_feat, neg_item_feat = batch
+
+                    # ======== 前向传播（使用自动混合精度可选）========
+                    if scaler:
+                        with torch.cuda.amp.autocast():
+                            user_embedding = embedding_model(user,user_feat).squeeze(0)
+                            item_1_embedding = embedding_model(input_item,input_item_feat).squeeze(0)
+                            pos_item_embedding = embedding_model(pos_item,pos_item_feat).squeeze(0)
+                            neg_item_1_embedding = embedding_model(neg_item,neg_item_feat).squeeze(0)
+                            neg_item_2_embedding = embedding_model(neg_item,neg_item_feat).squeeze(0)
+                            u2i_loss,u2i_pos_sim,u2i_neg_sim = embedding_model.embedding_loss(user_embedding,item_1_embedding,neg_item_1_embedding)
+                            i2i_loss,i2i_pos_sim,i2i_neg_sim = embedding_model.embedding_loss(item_1_embedding,pos_item_embedding,neg_item_2_embedding)
+                            self_i2i_loss,i2i_pos_sim,i2i_neg_sim = embedding_model.embedding_loss(neg_item_1_embedding.reshape(-1,neg_item_1_embedding.shape[-1]),neg_item_1_embedding.reshape(-1,neg_item_1_embedding.shape[-1]))
+                            loss = u2i_loss + i2i_loss 
+                    else:
+                        user_embedding = embedding_model(user,user_feat).squeeze(0)
+                        item_1_embedding = embedding_model(input_item,input_item_feat).squeeze(0)
+                        pos_item_embedding = embedding_model(pos_item,pos_item_feat).squeeze(0)
+                        neg_item_1_embedding = embedding_model(neg_item,neg_item_feat).squeeze(0)
+                        # neg_item_2_embedding = embedding_model(neg_item,neg_item_feat).squeeze(0)
+                        u2i_loss,u2i_pos_sim,u2i_neg_sim = embedding_model.embedding_loss(user_embedding,item_1_embedding,neg_item_1_embedding)
+                        i2i_loss,i2i_pos_sim,i2i_neg_sim = embedding_model.embedding_loss(item_1_embedding,pos_item_embedding,neg_item_1_embedding)
+                        self_i2i_loss,i2i_pos_sim,i2i_neg_sim = embedding_model.embedding_loss(neg_item_1_embedding.reshape(-1,neg_item_1_embedding.shape[-1]),neg_item_1_embedding.reshape(-1,neg_item_1_embedding.shape[-1]))
+                        loss = u2i_loss + i2i_loss 
+
+                        # L2 正则化：仅作用于 item_emb，避免过强惩罚
+                        if args.l2_emb > 0:
+                            l2_reg = 0.0
+                            for param in embedding_model.item_emb.parameters():
+                                l2_reg += torch.norm(param)
+                            loss += args.l2_emb * l2_reg
+
+                    # ======== 反向传播 ========
+                    optimizer.zero_grad()
+                    local_step +=1
+                    if scaler is not None:
+                        # 混合精度反向传播
+                        scaler.scale(loss).backward()
+                        # 梯度裁剪（在 unscale 之后）
+                        scaler.unscale_(optimizer)
+                        clip_grad_norm_(embedding_model.parameters(), max_norm=1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        # 普通精度
+                        loss.backward()
+                        clip_grad_norm_(embedding_model.parameters(), max_norm=1.0)
+                        optimizer.step()
+
+                    # 更新学习率调度器
+                    if scheduler is not None:
+                        scheduler.step()
+
+                    # ======== 日志记录 ========
+                    total_loss_epoch += loss.item()
+
+                    # 当前学习率
+                    current_lr = scheduler.get_last_lr()[0] if scheduler is not None else args.embedding_task_lr
+
+                    log_json = json.dumps({
+                        'global_step': global_step,
+                        'total_loss': round(loss.item(), 6),
+                        'u2i_loss': round(u2i_loss.item(), 6),
+                        "i2i_loss": round(i2i_loss.item(), 6),
+                        'learning_rate': round(current_lr, 8),
+                        'epoch': epoch,
+                        'time': time.time()
+                    })
+                    log_file.write(log_json + '\n')
+                    if verbose:
+                        print(log_json)
+                    log_file.flush()
+
+                    writer.add_scalar('Emd_Loss/total_loss', loss.item(), global_step)
+                    writer.add_scalar('Emd_Loss/u2i_loss', u2i_loss.item(), global_step)
+                    writer.add_scalar('Emd_Loss/i2i_loss', i2i_loss.item(), global_step)
+                    writer.add_scalar('Emd_Loss/self_i2i_loss', self_i2i_loss.item(), global_step)
+                    writer.add_scalar('Emd_Loss/Learning_rate', current_lr, global_step)
+
+                    global_step += 1
+                    pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{current_lr:.2e}'})
+                except Exception as e:
+                    print(f"\n❌ Error at epoch {epoch}, step {step}: {str(e)}")
+                    # 可选：保存当前 batch 数据用于 debug
+                    # torch.save(batch, "debug_batch.pt")
+                    raise  #    
+
+
+        avg_train_loss = total_loss_epoch / local_step
+        print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Time: {time.time() - t0:.2f}s")
+
+        # 验证阶段
+        embedding_model.eval()
+        val_loss = 0.0
+        val_ui2_loss = 0.0
+        val_i2i_loss = 0.0
+        val_self_i2i_loss = 0.0
+        vel_local_step = 0
+        with torch.no_grad():
+            for batch in tqdm(valid_loader, total=-1, desc="Validation", leave=True):
+                user, input_item, pos_item, neg_item, \
+                user_feat, input_item_feat, pos_item_feat, neg_item_feat = batch
+
+                user_embedding = embedding_model(user,user_feat).squeeze(0)
+                item_1_embedding = embedding_model(input_item,input_item_feat).squeeze(0)
+                pos_item_embedding = embedding_model(pos_item,pos_item_feat).squeeze(0)
+                neg_item_1_embedding = embedding_model(neg_item,neg_item_feat).squeeze(0)
+                neg_item_2_embedding = embedding_model(neg_item,neg_item_feat).squeeze(0)
+                u2i_loss,u2i_pos_sim,u2i_neg_sim = embedding_model.embedding_loss(user_embedding,item_1_embedding,neg_item_1_embedding)
+                i2i_loss,i2i_pos_sim,i2i_neg_sim = embedding_model.embedding_loss(item_1_embedding,pos_item_embedding,neg_item_1_embedding)
+                self_i2i_loss,i2i_pos_sim,i2i_neg_sim = embedding_model.embedding_loss(neg_item_1_embedding.reshape(-1,neg_item_1_embedding.shape[-1]),neg_item_1_embedding.reshape(-1,neg_item_1_embedding.shape[-1]))
+                loss = u2i_loss + i2i_loss 
+
+                val_loss += loss.item()
+                val_ui2_loss += u2i_loss.item()
+                val_i2i_loss += i2i_loss.item()
+                val_self_i2i_loss += self_i2i_loss.item()
+                vel_local_step += 1
+
+        val_loss /= vel_local_step
+        val_ui2_loss /= vel_local_step
+        val_i2i_loss /= vel_local_step
+        val_self_i2i_loss /= vel_local_step
+        writer.add_scalar('Emb_Valid/Loss', val_loss, global_step)
+        writer.add_scalar('Emb_Valid/u2i_loss', val_ui2_loss, global_step)
+        writer.add_scalar('Emb_Valid/i2i_loss', val_i2i_loss, global_step)
+        writer.add_scalar('Emb_Valid/self_i2i_loss', val_self_i2i_loss, global_step)
+        print(f"Epoch {epoch} | Emb_Valid Loss: {val_loss:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_dir = Path(os.environ.get('USER_CACHE_PATH')) / "global_best_embedding_model"
+            save_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(embedding_model.state_dict(), save_dir / "model.pt")
+            print(f"✅ 最佳模型已保存至: {save_dir / 'model.pt'}")
+
+    return global_step
+
+
+def run_embedding_training(
+        args,
+        train_emb_dataset,
+        valid_emb_dataset,
+        writer: SummaryWriter,
+        log_file,
+        final_save_dir,
+        device=None
+    ):
+    """
+    封装嵌入模型的完整训练流程：初始化、加载权重、训练、保存。
+
+    Args:
+        args: 训练参数命名空间，需包含以下字段：
+            - batch_size
+            - lr
+            - state_dict_path (可选)
+            - USER_CACHE_PATH
+            - 其他模型相关参数
+        train_emb_dataset: 训练数据集，需有 collate_fn
+        valid_emb_dataset: 验证数据集，需有 collate_fn
+        writer: TensorBoard SummaryWriter 实例
+        log_file: 日志文件对象（已打开）
+        device: 训练设备 (如 'cuda' 或 'cpu')
+
+    Returns:
+        embedding_model: 训练完成的模型
+        global_step: 总训练步数
+    """
+    print("🚀 开始构建嵌入模型训练流程...")
+
+    # ==========================
+    # 1. 数据加载器
+    # ==========================
+    train_loader = DataLoader(
+        train_emb_dataset,
+        batch_size=args.embedding_batch_size,
+        collate_fn=train_emb_dataset.collate_fn,
+        shuffle=False,  # 确保训练集打乱
+    )
+
+    valid_loader = DataLoader(
+        valid_emb_dataset,
+        batch_size=args.batch_size,
+        collate_fn=valid_emb_dataset.collate_fn,
+        shuffle=False,
+    )
+
+    print(f"📊 训练集 batch 数: {len(train_loader.dataset.sample_index)}, 验证集 batch 数: {len(valid_loader.dataset.sample_index)}")
+
+    # ==========================
+    # 2. 模型初始化
+    # ==========================
+    embedding_model = EmbeddingModel(
+        user_num=train_emb_dataset.base_dataset.usernum,
+        item_num=train_emb_dataset.base_dataset.itemnum,
+        feat_statistics=train_emb_dataset.base_dataset.feat_statistics,
+        feat_types=train_emb_dataset.base_dataset.feature_types,
+        args=args
+    ).to(args.device)
+
+    # 自定义初始化
+    initialize_model_weights(embedding_model)
+    print("✅ 模型权重已初始化")
+
+    # ==========================
+    # 3. 加载预训练权重（可选）
+    # ==========================
+    if args.state_dict_path:
+        try:
+            state_dict = torch.load(args.state_dict_path, map_location=args.device)
+            embedding_model.load_state_dict(state_dict)
+            print(f"✅ 成功加载预训练权重: {args.state_dict_path}")
+            log_file.write(f"INFO: Loaded pretrained weights from {args.state_dict_path}\n")
+        except Exception as e:
+            msg = f"❌ 加载预训练权重失败: {args.state_dict_path}, 错误: {str(e)}"
+            print(msg)
+            log_file.write(f"ERROR: {msg}\n")
+            raise RuntimeError(msg)
+
+    # ==========================
+    # 4. 优化器
+    # ==========================
+    optimizer = torch.optim.Adam(
+        embedding_model.parameters(),
+        lr=args.embedding_task_lr,
+        betas=(0.9, 0.98),
+        weight_decay=getattr(args, 'weight_decay', 0.0)  # 可选 weight decay
+    )
+
+    # ==========================
+    # 5. 开始训练
+    # ==========================
+    global_step = 0
+    print("🔥 开始训练...")
+    # try:
+    global_step = train_embedding_model(
+        embedding_model=embedding_model,
+        train_loader=train_loader,
+        valid_loader=valid_loader,
+        optimizer=optimizer,
+        args=args,
+        writer=writer,
+        log_file=log_file,
+        global_step=global_step
+    )
+    print("🎉 训练完成！")
+    # except Exception as e:
+    #     print(f"❌ 训练过程中发生错误: {e}")
+    #     raise
+
+    # ==========================
+    # 6. 保存最终模型
+    # ==========================
+    
+    final_save_dir.mkdir(parents=True, exist_ok=True)
+
+    save_path = final_save_dir / "model.pt"
+    torch.save(embedding_model.state_dict(), save_path)
+    print(f"✅ 最终嵌入模型已保存至: {save_path}")
+    log_file.write(f"INFO: Final model saved to {save_path}\n")
+
+    return embedding_model, global_step

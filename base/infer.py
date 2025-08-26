@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader
 from dataset import MyDataset, MyTestDataset, save_emb
 from faiss_demo import run_faiss_ann_search
 from torch.utils.tensorboard import SummaryWriter
-
+from model import BaselineModel
 # from train_embedding_dataset import TrainEmbeddingDataset
 # 本地infer算法
 def final_score(hit_rate,ndcg):
@@ -59,7 +59,7 @@ class Infer:
         if isinstance(self.eval_dataset, torch.utils.data.Dataset):
             self.total_data_size = len(self.eval_dataset)
         else:
-            self.total_data_size = self.eval_dataset.base_dataset.total_data_size
+            self.total_data_size = self.eval_dataset.total_data_size
         self.total_batch = self.total_data_size // args.batch_size
         # 再eval_dataset 中带有label_item,同时label也应该在condidate中
         self.candidate_path = candidate_path
@@ -126,10 +126,10 @@ class Infer:
         Returns:
             retrieve_id2creative_id: 索引id->creative_id的dict
         """
-        indexer = self.eval_dataset.base_dataset.indexer
-        feat_types = self.eval_dataset.base_dataset.feature_types
-        feat_default_value = self.eval_dataset.base_dataset.feature_default_value
-        mm_emb_dict = self.eval_dataset.base_dataset.mm_emb_dict
+        indexer = self.eval_dataset.indexer
+        feat_types = self.eval_dataset.feature_types
+        feat_default_value = self.eval_dataset.feature_default_value
+        mm_emb_dict = self.eval_dataset.mm_emb_dict
         model = self.model
         EMB_SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
         candidate_path = Path(self.candidate_path)
@@ -144,13 +144,13 @@ class Infer:
                 # 读取item特征，并补充缺失值
                 feature = condidate_map[str(item_id)]
                 if os.environ.get("DEBUG_MODE","")=="True":
-                    if item_id in self.eval_dataset.base_dataset.indexer_i_rev:
-                        creative_id = self.eval_dataset.base_dataset.indexer_i_rev[item_id] 
+                    if item_id in self.eval_dataset.indexer_i_rev:
+                        creative_id = self.eval_dataset.indexer_i_rev[item_id] 
                     else:
                         creative_id = 0
                         un_hit_cnt +=1
                 else:
-                    creative_id = self.eval_dataset.base_dataset.indexer_i_rev[item_id] 
+                    creative_id = self.eval_dataset.indexer_i_rev[item_id] 
                 missing_fields = set(
                     feat_types['item_sparse'] + feat_types['item_array'] + feat_types['item_continual']
                 ) - set(feature.keys())
@@ -270,9 +270,11 @@ def main():
     best_test_ndcg, best_test_hr = 0.0, 0.0
     t0 = time.time()
     print("Start training")
-    infer = Infer(args,model,eval_dataset=valid_dataset.dataset,candidate_path=os.path.join(os.environ.get('USER_CACHE_PATH'),'item_feat_dict_eval.json'))
+    infer = Infer(args,model,eval_dataset=valid_dataset.dataset,candidate_path=os.path.join(os.environ['USER_CACHE_PATH'], 'item_feat_dict_eval.json'))
     infer.infer()
 
 
 if __name__ == "__main__":
     main()
+
+# infer.py

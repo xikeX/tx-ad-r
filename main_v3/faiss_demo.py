@@ -5,7 +5,9 @@ from pathlib import Path
 import struct
 import numpy as np
 from typing import Optional
-
+import numpy as np
+import hnswlib
+from typing import Optional, Tuple, Union
 def read_fbin(filename: str) -> np.ndarray:
     """
     读取 .fbin 格式的向量文件。
@@ -64,15 +66,6 @@ def save_emb(emb, save_path):
     with open(Path(save_path), 'wb') as f:
         f.write(struct.pack('II', num_points, num_dimensions))
         emb.tofile(f)
-
-import os
-from pathlib import Path
-import struct
-import numpy as np
-from typing import Optional
-import numpy as np
-import hnswlib
-from typing import Optional, Tuple, Union
 
 
 def run_faiss_ann_search(
@@ -164,7 +157,6 @@ def run_faiss_ann_search(
     # ================== 7. 返回结果 ==================
     return labels  # 直接返回原始 ID，无需映射
 
-# import faiss
 # def run_faiss_ann_search(
 #     dataset_vector_file_path: str=None,
 #     dataset_id_file_path: str=None,
@@ -210,11 +202,12 @@ def run_faiss_ann_search(
 #     index.hnsw.efConstruction = faiss_ef_construction
 #     index.hnsw.efSearch = query_ef_search
 #     index.verbose = True
-
+#     index.add(dataset_vector)
+#     id_mapping = dict(enumerate(dataset_id))  # {faiss_index: original_id}
 #     # 包装成 IDMap 以保留原始 ID
-#     index = faiss.IndexIDMap2(index)  # 包装成 IDMap
+#     # index = faiss.IndexIDMap2(index)  # 包装成 IDMap
 #     dataset_id = dataset_id.ravel()
-#     index.add_with_ids(dataset_vector, dataset_id)
+#     # index.add_with_ids(dataset_vector, dataset_id)
 
 #     # ✅ 正确方式：通过 .index 访问底层 HNSW 索引
 #     # index.index.hnsw.efSearch = query_ef_search
@@ -223,8 +216,8 @@ def run_faiss_ann_search(
 #     if result_id_file_path is not None:
 #         print(f"Writing Top-{query_ann_top_k} results to {result_id_file_path}")
 #         # save_emb(indices.astype(np.uint64),result_id_file_path)
-
-#     return indices
+#     original_ids = np.array([[id_mapping.get(idx, -1) for idx in batch] for batch in indices])
+#     return original_ids
 
 # def run_faiss_ann_search_gpu(
 #     dataset_vector_file_path: str = None,

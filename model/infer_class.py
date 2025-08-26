@@ -270,7 +270,7 @@ def main():
     best_test_ndcg, best_test_hr = 0.0, 0.0
     t0 = time.time()
     print("Start training")
-    infer = Infer(args,model,eval_dataset=valid_dataset.dataset,candidate_path=os.path.join(os.environ.get('USER_CACHE_PATH'),'item_feat_dict_eval.json'))
+    infer = Infer(args,model,eval_dataset=valid_dataset.dataset,candidate_path=os.path.join(os.environ.get('TRAIN_DATA_PATH'),'item_feat_dict.json'))
     infer.infer()
 
 

@@ -1,4 +1,4 @@
-#my_dataset.py
+# my_dataset_v1_aug.py
 from io import BufferedReader
 import json
 import os
@@ -9,11 +9,22 @@ import random
 import numpy as np
 import torch
 from tqdm import tqdm
+import functools
+
+def get_position_from_numpy(row,pos):
+    return row[pos]
+
+get_position_function_map = {
+    0:np.vectorize(functools.partial(get_position_from_numpy,pos=0)),
+    1:np.vectorize(functools.partial(get_position_from_numpy,pos=1)),
+    2:np.vectorize(functools.partial(get_position_from_numpy,pos=2)),
+    3:np.vectorize(functools.partial(get_position_from_numpy,pos=3))
+}
 
 class BaseDataset():
     data_dir: Path
     data_file: BufferedReader
-    mm_emb_id: list
+    mm_emb_ids: list
     item_feat_dict: dict
     mm_emb_dict: dict
     item_num: int
@@ -21,7 +32,7 @@ class BaseDataset():
     indexer_i_rev: dict
     indexer_u_rev: dict
     indexer: dict
-    feature_default_value: dict
+    item_feature_default_value: dict
     feature_types: dict
     feat_statistics: dict
     seq_offsets:dict
@@ -48,7 +59,31 @@ class BaseDataset():
         self.indexer = indexer
 
         self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
+        self._init_feat_info_2(feat_statistics=self.feat_statistics, feature_types=self.feature_types)
+        self.item_feature_default_value = self.fill_missing_feat({},0,False)
+        self.user_feature_default_value = self.fill_missing_feat({},0,True)
+    def _init_feat_info_2(self, feat_statistics, feature_types):
+        """
+        将特征统计信息（特征数量）按特征类型分组产生不同的字典，方便声明稀疏特征的Embedding Table
 
+        Args:
+            feat_statistics: 特征统计信息，key为特征ID，value为特征数量
+            feat_types: 各个特征的特征类型，key为特征类型名称，value为包含的特征ID列表，包括user和item的sparse, array, emb, continual类型
+        """
+        self.USER_SPARSE_FEAT = {
+            k: feat_statistics[k] for k in feature_types['user_sparse']}
+        self.USER_CONTINUAL_FEAT = feature_types['user_continual']
+        self.ITEM_SPARSE_FEAT = {
+            k: feat_statistics[k] for k in feature_types['item_sparse']}
+        self.ITEM_CONTINUAL_FEAT = feature_types['item_continual']
+        self.USER_ARRAY_FEAT = {
+            k: feat_statistics[k] for k in feature_types['user_array']}
+        self.ITEM_ARRAY_FEAT = {
+            k: feat_statistics[k] for k in feature_types['item_array']}
+        EMB_SHAPE_DICT = {"81": 32, "82": 1024,
+                          "83": 3584, "84": 4096, "85": 3584, "86": 3584}
+        self.ITEM_EMB_FEAT = {
+            k: EMB_SHAPE_DICT[k] for k in feature_types['item_emb']}  # 记录的是不同多模态特征的维度
     ## data init
     def _init_feat_info(self):
         """
@@ -123,7 +158,7 @@ class BaseDataset():
         data = json.loads(line)
         return data
     
-    def fill_missing_feat(self, feat, item_id):
+    def fill_missing_feat(self, feat, item_id, is_user=False):
         """
         对于原始数据中缺失的特征进行填充缺省值
 
@@ -134,26 +169,64 @@ class BaseDataset():
         Returns:
             filled_feat: 填充后的特征字典
         """
-        if feat == None:
-            feat = {}
-        filled_feat = {}
-        for k in feat.keys():
-            filled_feat[k] = feat[k]
+        sparse_feature = []
+        continual_feature = []
+        array_feature = []
+        mm_emb = None
+        if is_user:
+            # user_array_feature_range
+            sparse_feature.append(item_id)
+            offset = 0
+            offset += self.usernum + 1
+            for k in self.USER_SPARSE_FEAT:
+                sparse_feature.append((feat[k]+offset if k in feat else 0))
+                offset += self.USER_SPARSE_FEAT[k] + 1
 
-        all_feat_ids = []
-        for feat_type in self.feature_types.values():
-            all_feat_ids.extend(feat_type)
-        missing_fields = set(all_feat_ids) - set(feat.keys())
-        for feat_id in missing_fields:
-            filled_feat[feat_id] = self.feature_default_value[feat_id]
-        for feat_id in self.feature_types['item_emb']:
-            if item_id != 0:
-                if self.indexer_i_rev[item_id] in self.mm_emb_dict[feat_id]:
-                    if type(self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]) == np.ndarray:
-                        filled_feat[feat_id] = self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]
+            for k in self.USER_CONTINUAL_FEAT:
+                continual_feature.append(feat[k] if k in feat else 0)
 
-        return filled_feat
+            offset = 0
+            for k in self.USER_ARRAY_FEAT:
+                f = [i+offset for i in feat[k][:10]] if k in feat else []
+                array_feature.extend(f+[0]*(10-len(f)))
+                offset += self.USER_ARRAY_FEAT[k]+1
+            # return sparse_feature, continual_feature, array_feature, mm_emb
+            return {
+                "sparse_feature": sparse_feature,
+                "continual_feature": continual_feature,
+                "array_feature": array_feature
+            }
+        else:
+            # user_array_feature_range
+            sparse_feature.append(item_id)
 
+            offset = 0
+            offset += self.itemnum + 1
+            for k in self.ITEM_SPARSE_FEAT:
+                sparse_feature.append((feat[k]+offset if k in feat else 0))
+                offset += self.ITEM_SPARSE_FEAT[k] + 1
+            for k in self.ITEM_CONTINUAL_FEAT:
+                continual_feature.append(feat[k])
+
+            offset = 0
+            for k in self.ITEM_ARRAY_FEAT:
+                f = [i+offset for i in feat[k][:10]] if k in feat else []
+                array_feature.extend(f+[0]*(10-len(feat[k])))
+                offset += self.ITEM_ARRAY_FEAT[k]
+            mm_emb = self.feature_default_value[self.mm_emb_ids[0]]
+            for feat_id in self.feature_types['item_emb']:
+                if item_id != 0:
+                    if self.indexer_i_rev[item_id] in self.mm_emb_dict[feat_id]:
+                        if type(self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]) == np.ndarray:
+                            mm_emb = self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]
+            # return sparse_feature, continual_feature, array_feature, mm_emb
+            return {
+                "sparse_feature": sparse_feature,
+                "continual_feature": continual_feature,
+                "array_feature": array_feature,
+                "mm_emb": mm_emb
+            }
+    
 
     def _process_cold_start_feat(self, feat):
         """
@@ -294,24 +367,52 @@ class TrainDataset(torch.utils.data.Dataset):
                 ext_user_sequence.append((i, item_feat, 1, action_type))
                 if action_type==0:
                     explore_unlick_sample_index.append(len(ext_user_sequence)-1)
-        # if len(explore_unlick_sample_index)>2:
-        #     while random.random()<0.2:
-        #         a = random.choice(explore_unlick_sample_index)
-        #         b = random.choice(explore_unlick_sample_index)
-        #         ext_user_sequence[a], ext_user_sequence[b] = ext_user_sequence[b], ext_user_sequence[a]
+        if len(explore_unlick_sample_index)>2:
+            while random.random()<0.2:
+                a = random.choice(explore_unlick_sample_index)
+                b = random.choice(explore_unlick_sample_index)
+                ext_user_sequence[a], ext_user_sequence[b] = ext_user_sequence[b], ext_user_sequence[a]
         if cur_u!=None: # 插入用户
             ext_user_sequence.insert(0, (cur_u, cur_user_feat, 2, cur_action_type))
-        seq = np.zeros([self.max_padding_size + 1], dtype=np.int32) # 输入序列
-        pos = np.zeros([self.max_padding_size + 1], dtype=np.int32) # 正样本序列
-        neg = np.zeros([(self.max_padding_size + 1) * self.neg_sample_size], dtype=np.int32) # 负样本序列
         
         token_type = np.zeros([self.max_padding_size + 1], dtype=np.int32) # 是用户还是商品 0/1/2
         next_token_type = np.zeros([self.max_padding_size + 1], dtype=np.int32)
         next_action_type = np.zeros([self.max_padding_size + 1], dtype=np.int32)
+        if cur_user_feat is None:
+            cur_user_feat = {}
+            cur_u = 0
+        user_feat = self.base_dataset.fill_missing_feat(cur_user_feat, cur_u, True)
+        user_feat_sparse = user_feat['sparse_feature']
+        user_feat_continual = user_feat['continual_feature']
+        user_feat_array = user_feat['array_feature']
 
-        seq_feat = np.empty([self.max_padding_size + 1], dtype=object)
-        pos_feat = np.empty([self.max_padding_size + 1], dtype=object)
-        neg_feat = np.empty([(self.max_padding_size + 1) * self.neg_sample_size], dtype=object)
+        seq_feat_sparse = np.full([self.max_padding_size + 1,len(self.base_dataset.item_feature_default_value["sparse_feature"])],
+                                  self.base_dataset.item_feature_default_value["sparse_feature"], dtype=np.int32)
+        seq_feat_continual = np.full([self.max_padding_size + 1,len(self.base_dataset.item_feature_default_value["continual_feature"])]
+                                      ,self.base_dataset.item_feature_default_value["continual_feature"], dtype=np.float32)
+        seq_feat_array = np.full([self.max_padding_size + 1,len(self.base_dataset.item_feature_default_value["array_feature"])],
+                                  self.base_dataset.item_feature_default_value["array_feature"], dtype=np.int32)
+        seq_feat_mm_embs = np.full([self.max_padding_size + 1,len(self.base_dataset.item_feature_default_value["mm_emb"])],
+                                  self.base_dataset.item_feature_default_value["mm_emb"], dtype=np.float32)
+    
+        pos_feat_sparse = np.full([self.max_padding_size + 1,len(self.base_dataset.item_feature_default_value["sparse_feature"])],
+                                  self.base_dataset.item_feature_default_value["sparse_feature"], dtype=np.int32)
+        pos_feat_continual = np.full([self.max_padding_size + 1,len(self.base_dataset.item_feature_default_value["continual_feature"])]
+                                      ,self.base_dataset.item_feature_default_value["continual_feature"], dtype=np.float32)
+        pos_feat_array = np.full([self.max_padding_size + 1,len(self.base_dataset.item_feature_default_value["array_feature"])],
+                                  self.base_dataset.item_feature_default_value["array_feature"], dtype=np.int32)
+        pos_feat_mm_embs = np.full([self.max_padding_size + 1,len(self.base_dataset.item_feature_default_value["mm_emb"])],
+                                  self.base_dataset.item_feature_default_value["mm_emb"], dtype=np.float32)
+    
+        neg_feat_sparse = np.full([(self.max_padding_size + 1) * self.neg_sample_size,len(self.base_dataset.item_feature_default_value["sparse_feature"])],
+                                  self.base_dataset.item_feature_default_value["sparse_feature"], dtype=np.int32)
+        neg_feat_continual = np.full([(self.max_padding_size + 1) * self.neg_sample_size,len(self.base_dataset.item_feature_default_value["continual_feature"])],
+                                  self.base_dataset.item_feature_default_value["continual_feature"], dtype=np.int32)
+        neg_feat_array = np.full([(self.max_padding_size + 1) * self.neg_sample_size,len(self.base_dataset.item_feature_default_value["array_feature"])],
+                            self.base_dataset.item_feature_default_value["array_feature"], dtype=np.int32)
+        neg_feat_mm_embs = np.full([(self.max_padding_size + 1) * self.neg_sample_size,len(self.base_dataset.item_feature_default_value["mm_emb"])],
+                                  self.base_dataset.item_feature_default_value["mm_emb"], dtype=np.float32)
+
 
         idx = self.max_padding_size
 
@@ -327,36 +428,40 @@ class TrainDataset(torch.utils.data.Dataset):
         for record_tuple in reversed(ext_user_sequence[:-1]):
             i, feat, type_, act_type = record_tuple
             feat = self.base_dataset.fill_missing_feat(feat, i)
-            seq[idx] = i
             token_type[idx] = type_
             next_token_type[idx] = next_type
             if next_act_type is not None:
                 next_action_type[idx] = next_act_type
-            if type_==2:
-                feat['81'] = self.base_dataset.feature_default_value['81']
-            seq_feat[idx] = feat
+            if  type_==1:
+                seq_feat_sparse[idx], seq_feat_continual[idx], seq_feat_array[idx], seq_feat_mm_embs[idx] = \
+                    feat['sparse_feature'], feat['continual_feature'], feat['array_feature'], feat['mm_emb']
+            else:
+                ...
             if next_type == 1 and next_i != 0:
-                pos[idx] = next_i
-                pos_feat[idx] = next_feat
+                pos_feat_sparse[idx], pos_feat_continual[idx], pos_feat_array[idx], pos_feat_mm_embs[idx] = \
+                    next_feat['sparse_feature'], next_feat['continual_feature'], next_feat['array_feature'], next_feat['mm_emb']
                 # 总感觉这样采样不合适，自回归模型基本没有这样采样的方式
                 for j in range( self.neg_sample_size):
                     neg_id = self.base_dataset._random_neq(1, self.base_dataset.itemnum + 1, ts)
-                    neg[idx + self.max_padding_size * j] = neg_id
-                    neg_feat[idx + self.max_padding_size * j] = self.base_dataset.fill_missing_feat(self.base_dataset.item_feat_dict[str(neg_id)], neg_id)
-
+                    feature_map = self.base_dataset.fill_missing_feat(self.base_dataset.item_feat_dict[str(neg_id)], neg_id)
+                    position = idx + self.max_padding_size * j
+                    neg_feat_sparse[position],neg_feat_continual[position],neg_feat_array[position],neg_feat_mm_embs[position]=\
+                        feature_map['sparse_feature'], feature_map['continual_feature'], feature_map['array_feature'], feature_map['mm_emb']
             next_i, next_feat, next_type, next_act_type, next_feat = \
                 i, feat, type_, act_type, feat
             idx -= 1
             if idx == -1:
                 break
+        
+        # seq_feat = np.where(seq_feat == None, self.base_dataset.item_feature_default_value, seq_feat)
+        # pos_feat = np.where(pos_feat == None, self.base_dataset.item_feature_default_value, pos_feat)
+        # neg_feat = np.where(neg_feat == None, self.base_dataset.item_feature_default_value, neg_feat)
 
-        seq_feat = np.where(seq_feat == None, self.base_dataset.feature_default_value, seq_feat)
-        pos_feat = np.where(pos_feat == None, self.base_dataset.feature_default_value, pos_feat)
-        neg_feat = np.where(neg_feat == None, self.base_dataset.feature_default_value, neg_feat)
+        return token_type, next_token_type, next_action_type, seq_feat_sparse, seq_feat_continual, seq_feat_array, seq_feat_mm_embs, \
+                pos_feat_sparse, pos_feat_continual, pos_feat_array, pos_feat_mm_embs,\
+                neg_feat_sparse, neg_feat_continual, neg_feat_array, neg_feat_mm_embs,\
+                user_feat_sparse, user_feat_continual, user_feat_array
 
-        return seq, pos, neg, \
-               token_type, next_token_type, next_action_type,\
-               seq_feat, pos_feat, neg_feat
     
     @staticmethod
     def collate_fn(batch):
@@ -374,17 +479,38 @@ class TrainDataset(torch.utils.data.Dataset):
             pos_feat: 正样本特征, list形式
             neg_feat: 负样本特征, list形式
         """
-        seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = zip(*batch)
-        seq = torch.from_numpy(np.array(seq))
-        pos = torch.from_numpy(np.array(pos))
-        neg = torch.from_numpy(np.array(neg))
-        token_type = torch.from_numpy(np.array(token_type))
-        next_token_type = torch.from_numpy(np.array(next_token_type))
-        next_action_type = torch.from_numpy(np.array(next_action_type))
-        seq_feat = list(seq_feat)
-        pos_feat = list(pos_feat)
-        neg_feat = list(neg_feat)
-        return seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
+        token_type, next_token_type, next_action_type, seq_feat_sparse, seq_feat_continual, seq_feat_array, seq_feat_mm_embs, \
+                pos_feat_sparse, pos_feat_continual, pos_feat_array, pos_feat_mm_embs,\
+                neg_feat_sparse, neg_feat_continual, neg_feat_array, neg_feat_mm_embs,\
+                user_feat_sparse, user_feat_continual, user_feat_array = zip(*batch)
+        return_batch = {}
+        return_batch['token_type'] = torch.from_numpy(np.array(token_type))
+        return_batch['next_token_type'] = torch.from_numpy(np.array(next_token_type))
+        return_batch['next_action_type'] = torch.from_numpy(np.array(next_action_type))
+        return_batch['seq_feat'] = {
+            "item_sparse_feature": torch.tensor(np.stack(seq_feat_sparse,axis=0)),
+            "item_continual_feature": torch.tensor(np.stack(seq_feat_continual,axis=0)),
+            "item_array_feature": torch.tensor(np.stack(seq_feat_array,axis=0)),
+            "item_mm_embs": torch.tensor(np.stack(seq_feat_mm_embs,axis=0)),
+        }
+        return_batch['pos_feat'] = {
+            "item_sparse_feature": torch.tensor(np.stack(pos_feat_sparse,axis=0)),
+            "item_continual_feature": torch.tensor(np.stack(pos_feat_continual,axis=0)),
+            "item_array_feature": torch.tensor(np.stack(pos_feat_array,axis=0)),
+            "item_mm_embs": torch.tensor(np.stack(pos_feat_mm_embs,axis=0)),
+        }
+        return_batch['neg_feat'] = {
+            "item_sparse_feature": torch.tensor(np.stack(neg_feat_sparse,axis=0)),
+            "item_continual_feature": torch.tensor(np.stack(neg_feat_continual,axis=0)),
+            "item_array_feature": torch.tensor(np.stack(neg_feat_array,axis=0)),
+            "item_mm_embs": torch.tensor(np.stack(neg_feat_mm_embs,axis=0)),
+        }
+        return_batch['user_feat'] = {
+            "user_sparse_feature": torch.tensor(user_feat_sparse),
+            "user_continual_feature": torch.tensor(user_feat_continual),
+            "user_array_feature": torch.tensor(user_feat_array)
+        }
+        return return_batch
 
 
 
@@ -414,7 +540,7 @@ class ValidDataset(torch.utils.data.Dataset):
         return len(self.sample_index)
     
     def build_example(self, user_sequence):
-
+        user_sparse_feature, user_continual_feature, user_array_feature = None,None,None
         ext_user_sequence = []
         for record_tuple in user_sequence:
             u, i, user_feat, item_feat, action_type, _ = record_tuple
@@ -428,6 +554,8 @@ class ValidDataset(torch.utils.data.Dataset):
                     u = 0
                 if user_feat:
                     user_feat = self.base_dataset._process_cold_start_feat(user_feat)
+                feat = self.base_dataset.fill_missing_feat(user_feat, u,is_user=True)
+                user_sparse_feature, user_continual_feature, user_array_feature = feat['sparse_feature'], feat['continual_feature'], feat['array_feature']
                 ext_user_sequence.insert(0, (u, user_feat, 2, action_type))
 
             if i and item_feat:
@@ -437,15 +565,23 @@ class ValidDataset(torch.utils.data.Dataset):
                 if item_feat:
                     item_feat = self.base_dataset._process_cold_start_feat(item_feat)
                 ext_user_sequence.append((i, item_feat, 1,action_type))
+        if user_sparse_feature is None:
+            user_sparse_feature, user_continual_feature, user_array_feature = self.base_dataset.user_feature_default_value['sparse_feature'], self.base_dataset.user_feature_default_value['continual_feature'], self.base_dataset.user_feature_default_value['array_feature']
         last_index_action_type_eq_1 = None
         for index,item in enumerate(ext_user_sequence):
             if item[-1]==1:
                 last_index_action_type_eq_1=index
         if last_index_action_type_eq_1:
             ext_user_sequence = ext_user_sequence[:last_index_action_type_eq_1+1]
-        seq = np.zeros([self.max_padding_size + 1], dtype=np.int32)
         token_type = np.zeros([self.max_padding_size + 1], dtype=np.int32)
-        seq_feat = np.empty([self.max_padding_size + 1], dtype=object)
+        seq_feat_sparse = np.full([self.max_padding_size + 1,len(self.base_dataset.item_feature_default_value["sparse_feature"])],
+                                  self.base_dataset.item_feature_default_value["sparse_feature"], dtype=np.int32)
+        seq_feat_continual = np.full([self.max_padding_size + 1,len(self.base_dataset.item_feature_default_value["continual_feature"])]
+                                      ,self.base_dataset.item_feature_default_value["continual_feature"], dtype=np.float32)
+        seq_feat_array = np.full([self.max_padding_size + 1,len(self.base_dataset.item_feature_default_value["array_feature"])],
+                                  self.base_dataset.item_feature_default_value["array_feature"], dtype=np.int32)
+        seq_feat_mm_embs = np.full([self.max_padding_size + 1,len(self.base_dataset.item_feature_default_value["mm_emb"])],
+                                  self.base_dataset.item_feature_default_value["mm_emb"], dtype=np.float32)
 
         idx = self.max_padding_size
 
@@ -457,18 +593,15 @@ class ValidDataset(torch.utils.data.Dataset):
         for record_tuple in reversed(ext_user_sequence[:-1]):
             i, feat, type_,_ = record_tuple
             feat = self.base_dataset.fill_missing_feat(feat, i)
-            seq[idx] = i
             token_type[idx] = type_
-            if type_==2:
-                feat['81'] = self.base_dataset.feature_default_value['81']
-            seq_feat[idx] = feat
+            if type_ != 2:
+                seq_feat_sparse[idx], seq_feat_continual[idx], seq_feat_array[idx], seq_feat_mm_embs[idx] = \
+                    feat["sparse_feature"], feat["continual_feature"], feat["array_feature"], feat["mm_emb"]
             idx -= 1
             if idx == -1:
                 break
-
-        seq_feat = np.where(seq_feat == None, self.base_dataset.feature_default_value, seq_feat)
         label = ext_user_sequence[-1]
-        return seq, token_type, seq_feat, user_id, label
+        return token_type, seq_feat_sparse,seq_feat_continual,seq_feat_array, seq_feat_mm_embs, user_sparse_feature, user_continual_feature, user_array_feature, label
     
     
     @staticmethod
@@ -485,12 +618,22 @@ class ValidDataset(torch.utils.data.Dataset):
             seq_feat: 用户序列特征, list形式
             user_id: user_id, str
         """
-        seq, token_type, seq_feat, user_id, label = zip(*batch)
-        seq = torch.from_numpy(np.array(seq))
-        token_type = torch.from_numpy(np.array(token_type))
-        seq_feat = list(seq_feat)
-
-        return seq, token_type, seq_feat, user_id, label
+        return_batch = {}
+        token_type, seq_feat_sparse,seq_feat_continual,seq_feat_array, seq_feat_mm_embs, user_sparse_feature, user_continual_feature, user_array_feature, label = zip(*batch)
+        return_batch['token_type'] = torch.from_numpy(np.array(token_type))
+        return_batch['seq_feat'] = {
+            "item_sparse_feature": torch.from_numpy(np.stack(seq_feat_sparse, axis=0)),
+            "item_continual_feature": torch.from_numpy(np.stack(seq_feat_continual, axis=0)),
+            "item_array_feature": torch.from_numpy(np.stack(seq_feat_array, axis=0)),
+            "item_mm_embs": torch.from_numpy(np.stack(seq_feat_mm_embs, axis=0)),
+        }
+        return_batch['user_feat'] = {
+            "user_sparse_feature": torch.tensor(user_sparse_feature),
+            "user_continual_feature": torch.tensor(user_continual_feature),
+            "user_array_feature": torch.tensor(user_array_feature),
+        }
+        return_batch['label'] = label
+        return return_batch
     
 
 class EmbeddingDataset(torch.utils.data.IterableDataset):
@@ -612,4 +755,5 @@ class EmbeddingDataset(torch.utils.data.IterableDataset):
         input_item_feature = [list(input_item_feature)]
         pos1_item_feature = [list(pos1_item_feature)]
         neg1_item_feature_list = list(neg1_item_feature_list)
+        #
         return user, input_item, pos1_item, neg1_item_list, user_featrue, input_item_feature, pos1_item_feature, neg1_item_feature_list
